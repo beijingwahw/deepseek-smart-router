@@ -19,8 +19,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .budget import apply_budget
+from .cache import SemanticCache
 from .classifier import classify, detect_task_profile, route
 from .config import enabled_models, load_config
+from .embedder import build_embedder
+from .judge import cascade_start_tier, judge_response, should_escalate
 from .learner import Learner
 from .proxy import SmartRouter, UpstreamError
 from .stats import Stats, calc_cost
@@ -33,17 +36,31 @@ cfg = load_config()
 stats = Stats(cfg["stats"]["db_path"])
 learner = Learner(cfg["stats"]["db_path"])
 router = SmartRouter(cfg, learner=learner)
+
+
+def _build_cache(cfg):
+    c = cfg.get("cache", {})
+    if not c.get("enabled"):
+        return None
+    return SemanticCache(cfg["stats"]["db_path"], build_embedder(cfg),
+                         threshold=c.get("threshold", 0.75),
+                         ttl_seconds=c.get("ttl_seconds", 86400),
+                         max_entries=c.get("max_entries", 10000))
+
+
+cache = _build_cache(cfg)
 TH = cfg["thresholds"]
 ALIASES = cfg.get("aliases", {})
 BUDGET = cfg.get("budget", {})
+CASCADE = cfg.get("cascade", {})
 _config_mtime: float | None = None
 
-app = FastAPI(title="DeepSeek Smart Router", version="1.0.0")
+app = FastAPI(title="DeepSeek Smart Router", version="2.0.0")
 
 
 def _reload_if_changed() -> None:
-    """配置文件变更时热重载: 模型池/阈值/预算立即生效, 学习成果保留."""
-    global cfg, router, TH, ALIASES, BUDGET, _config_mtime
+    """配置文件变更时热重载: 模型池/阈值/预算/缓存/级联立即生效, 学习成果保留."""
+    global cfg, router, cache, TH, ALIASES, BUDGET, CASCADE, _config_mtime
     if not CONFIG_PATH or not Path(CONFIG_PATH).exists():
         return
     mtime = os.path.getmtime(CONFIG_PATH)
@@ -56,9 +73,13 @@ def _reload_if_changed() -> None:
     disabled = router.disabled  # 保留运行时禁用状态
     router = SmartRouter(cfg, learner=learner)
     router.disabled = disabled
+    new_cache = _build_cache(cfg)
+    if new_cache is not None or cache is None:
+        cache = new_cache or cache  # 缓存对象复用, 保住命中率
     TH = cfg["thresholds"]
     ALIASES = cfg.get("aliases", {})
     BUDGET = cfg.get("budget", {})
+    CASCADE = cfg.get("cascade", {})
     _config_mtime = mtime
 
 
@@ -122,7 +143,7 @@ def _plan(payload: dict) -> tuple[str, str | None, object]:
 @app.get("/health")
 async def health():
     return {
-        "status": "ok", "version": "1.0.0-genesis",
+        "status": "ok", "version": "2.0.0-frontier",
         "models": {n: {"provider": m["provider"], "model": m["model"],
                        "tier": m.get("tier"), "enabled": m.get("enabled", True),
                        "disabled_at_runtime": n in router.disabled}
@@ -130,6 +151,8 @@ async def health():
         "aliases": ALIASES, "thresholds": TH,
         "budget": {**BUDGET, "spent_today": round(stats.daily_spend(), 4)},
         "learner": learner.summary(),
+        "cache": cache.stats() if cache else {"enabled": False},
+        "cascade": {"enabled": CASCADE.get("enabled", False)},
     }
 
 
@@ -157,6 +180,30 @@ async def route_preview(request: Request):
     }
 
 
+def _cache_query(payload: dict) -> str:
+    """缓存键文本: 最后一条用户消息."""
+    from .classifier import _last_user_text
+    return _last_user_text(payload.get("messages", []) or [])
+
+
+def _cacheable(payload: dict, task: dict) -> bool:
+    return (cache is not None and not payload.get("stream")
+            and not task["needs_tools"] and not task["needs_vision"])
+
+
+class _CacheResult:
+    """缓存命中的记账占位."""
+
+    def __init__(self, cached_model: str):
+        self.model_name = ""
+        self.model = cached_model
+        self.provider = "cache"
+        self.tier = "cache"
+        self.latency_ms = 0
+        self.status = "cache_hit"
+        self.fell_back_from = None
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     payload = await request.json()
@@ -170,8 +217,25 @@ async def chat_completions(request: Request):
     task = detect_task_profile(payload)
     chain = router.candidate_chain(tier, pinned, task)
     reasons = "; ".join(f.reasons) or "无显著信号"
+    is_stream = bool(payload.get("stream"))
 
-    if payload.get("stream"):
+    # ---- Frontier 第一层: 语义缓存 (仅非流式安全请求) ----
+    if _cacheable(payload, task):
+        cached = cache.lookup(_cache_query(payload), tier)
+        if cached is not None:
+            result = _CacheResult(cached.get("model", "unknown"))
+            request_id = _record(result, f.score, reasons + "; 语义缓存命中",
+                                 cached.get("usage", {}) or {}, "cache_hit")
+            cached["router"] = {**cached.get("router", {}),
+                                "request_id": request_id, "tier": "cache",
+                                "score": f.score}
+            return JSONResponse(content=cached,
+                                headers={"X-Router-Tier": "cache",
+                                         "X-Router-Cache": "hit",
+                                         "X-Router-Request-Id": str(request_id)})
+
+    # ---- 流式: 直接走候选链 (级联与缓存只服务非流式) ----
+    if is_stream:
         try:
             result, stream, usage_holder = await router.chat_stream(
                 chain, payload, task)
@@ -193,6 +257,63 @@ async def chat_completions(request: Request):
                      "X-Router-Model": result.model,
                      "X-Router-Score": str(f.score)})
 
+    # ---- Frontier 第二层: 级联升级 (便宜档先答, 评审不合格再升级) ----
+    cascade_info = None
+    if (CASCADE.get("enabled") and not pinned
+            and cascade_start_tier(tier) is not None):
+        start_tier = cascade_start_tier(tier)
+        start_chain = router.candidate_chain(start_tier, None, task)
+        if start_chain:
+            try:
+                first = await router.chat(start_chain, payload, task)
+                jscore, jreasons = judge_response(first.response, task)
+                usage1 = first.usage or {}
+                if not usage1.get("prompt_tokens"):
+                    usage1["prompt_tokens"] = _estimate_tokens(payload)
+                    usage1["completion_tokens"] = 0
+                if should_escalate(jscore,
+                                   CASCADE.get("judge_threshold", 0.55)):
+                    # 不合格: 差评反哺 + 升级到原计划链
+                    learner.record(first.model_name, task.get("tags") or [], 0.2)
+                    _record(first, f.score,
+                            reasons + f"; 级联升级(评审{jscore}: "
+                            f"{'/'.join(jreasons) or '质量不足'})",
+                            usage1, "cascade_escalated")
+                    cascade_info = {"started_tier": start_tier,
+                                    "first_model": first.model,
+                                    "judge_score": jscore,
+                                    "escalated": True}
+                else:
+                    # 合格: 好评反哺, 直接交卷 (省下了高档的钱)
+                    learner.record(first.model_name, task.get("tags") or [], 0.9)
+                    request_id = _record(first, f.score,
+                                         reasons + f"; 级联一次通过(评审{jscore})",
+                                         usage1, "cascade_accept")
+                    body = dict(first.response or {})
+                    body["router"] = {
+                        "request_id": request_id, "tier": first.tier,
+                        "model_name": first.model_name, "model": first.model,
+                        "provider": first.provider, "score": f.score,
+                        "reasons": f.reasons, "status": "cascade_accept",
+                        "cascade": {"started_tier": start_tier,
+                                    "judge_score": jscore,
+                                    "escalated": False,
+                                    "planned_tier": tier},
+                    }
+                    if _cacheable(payload, task):
+                        cache.store(_cache_query(payload), tier, body,
+                                    first.model)
+                    return JSONResponse(
+                        content=body,
+                        headers={"X-Router-Tier": first.tier,
+                                 "X-Router-Model": first.model,
+                                 "X-Router-Score": str(f.score),
+                                 "X-Router-Cascade": "accept",
+                                 "X-Router-Request-Id": str(request_id)})
+            except UpstreamError:
+                pass  # 便宜档全挂: 落到原计划链
+
+    # ---- 常规路径: 计划候选链 ----
     try:
         result = await router.chat(chain, payload, task)
     except UpstreamError as e:
@@ -212,6 +333,13 @@ async def chat_completions(request: Request):
         "score": f.score, "reasons": f.reasons,
         "status": result.status, "fell_back_from": result.fell_back_from,
     }
+    if cascade_info:
+        body["router"]["cascade"] = cascade_info
+    # 写入语义缓存 (评审合格才存, 防止缓存劣质答案)
+    if _cacheable(payload, task):
+        jscore, _ = judge_response(body, task)
+        if jscore >= CASCADE.get("judge_threshold", 0.55):
+            cache.store(_cache_query(payload), tier, body, result.model)
     return JSONResponse(
         content=body,
         headers={"X-Router-Tier": result.tier,
@@ -259,6 +387,8 @@ async def get_stats():
     d["learner"] = learner.summary()
     d["latency"] = stats.latency_by_model()
     d["budget"] = {**BUDGET, "spent_today": round(stats.daily_spend(), 4)}
+    d["cache"] = cache.stats() if cache else {"enabled": False}
+    d["cascade"] = {"enabled": CASCADE.get("enabled", False)}
     return d
 
 
@@ -304,3 +434,5 @@ async def dashboard():
 async def shutdown():
     stats.close()
     learner.close()
+    if cache:
+        cache.close()

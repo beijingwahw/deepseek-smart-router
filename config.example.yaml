@@ -158,5 +158,22 @@ aliases:
 #   daily_usd: 10.0          # 日花费上限 (按 price 表核算)
 #   on_exceed: downgrade     # downgrade(困难档自动降标准档) | block(直接 429)
 
+# ---------------- 语义缓存 (Frontier, GPTCache 路线) ----------------
+# 相似问题直接返回缓存答案, 零成本零延迟; 只对非流式/无工具/无视觉请求生效
+# cache:
+#   enabled: true
+#   threshold: 0.75          # 内置哈希向量建议 0.7-0.8; 换 API embedding 建议 0.85-0.9
+#   ttl_seconds: 86400
+#   max_entries: 10000
+#   # embed:                 # 可选: 用 API embedding 替换内置哈希向量, 精度更高
+#   #   provider: openai
+#   #   model: text-embedding-3-small
+
+# ---------------- 级联升级 (Frontier, FrugalGPT 路线) ----------------
+# 模糊任务先降一档作答, 内置评审不合格再升级到原档位; 升级事件反哺学习引擎
+# cascade:
+#   enabled: true
+#   judge_threshold: 0.55    # 评审分低于此值即升级
+
 stats:
   db_path: router_stats.db   # 请求统计与学习数据共用此库

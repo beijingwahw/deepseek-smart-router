@@ -31,6 +31,7 @@
   .tag-standard { background: #1c3d5a; color: #58a6ff; }
   .tag-hard { background: #4d3a10; color: #d29922; }
   .tag-error { background: #4d1a1a; color: #f85149; }
+  .tag-cache { background: #153d22; color: #3fb950; }
   .reasons { color: #8b98a5; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   h2 { font-size: 15px; margin-bottom: 10px; color: #adbac7; }
   .section { background: #1a2029; border: 1px solid #2a3442; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -46,6 +47,7 @@
   <div class="card"><div class="label">省下的钱 (vs 全走 R1)</div><div class="value green" id="savedH">-</div></div>
   <div class="card"><div class="label">省下的钱 (vs 全走 V3)</div><div class="value green" id="savedS">-</div></div>
   <div class="card"><div class="label">总 Token (入/出)</div><div class="value orange" id="tokens" style="font-size:16px">-</div></div>
+  <div class="card"><div class="label">语义缓存命中率</div><div class="value green" id="cacheRate">-</div></div>
 </div>
 
 <div class="section">
@@ -97,6 +99,10 @@ async function refresh() {
     $('savedH').textContent = fmt$(d.saved_vs_hard);
     $('savedS').textContent = fmt$(d.saved_vs_standard);
     $('tokens').textContent = fmtT(d.pt) + ' / ' + fmtT(d.ct);
+    const c = d.cache || {};
+    $('cacheRate').textContent = c.enabled
+      ? ((c.hit_rate*100).toFixed(1) + '% (' + c.hits + '/' + (c.hits+c.misses) + ')')
+      : '未启用';
 
     const t = d.tiers || {}, total = (t.trivial||0)+(t.standard||0)+(t.hard||0) || 1;
     $('bars').innerHTML = ['trivial','standard','hard'].map(k =>

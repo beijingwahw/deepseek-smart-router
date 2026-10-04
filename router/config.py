@@ -64,6 +64,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "smart": "hard", "reasoning": "hard",
         "default": "standard",
     },
+    # Frontier: 语义缓存 (相似问题零成本命中)
+    "cache": {
+        "enabled": False,
+        "threshold": 0.75,        # 余弦相似度阈值 (内置哈希向量建议 0.7-0.8;
+                                  # 换 API embedding 时建议调回 0.85-0.9)
+        "ttl_seconds": 86400,
+        "max_entries": 10000,
+        # "embed": {"provider": "openai", "model": "text-embedding-3-small"},
+    },
+    # Frontier: 级联升级 (便宜模型先答, 评审不合格再升级)
+    "cascade": {
+        "enabled": False,
+        "judge_threshold": 0.55,
+    },
     "stats": {"db_path": "router_stats.db"},
 }
 
