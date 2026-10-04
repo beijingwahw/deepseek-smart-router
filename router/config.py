@@ -16,6 +16,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 同档内多模型的挑选策略:
         # best_fit(按任务类型x模型能力画像, 推荐) / priority / cheapest / round_robin
         "strategy": "best_fit",
+        # λ 质量-成本拨盘: 0=极限省钱, 1=极限质量, 0.55 为平衡默认
+        "quality_lambda": 0.55,
         "fallback_enabled": True,
         # 某档全部不可用时的跨档降级顺序
         "cross_tier_fallback": {
@@ -77,6 +79,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cascade": {
         "enabled": False,
         "judge_threshold": 0.55,
+    },
+    # Omega: kNN 经验回忆 (相似历史任务的成败指导路由)
+    "memory": {
+        "enabled": False,
+        "k": 5,
+        "min_sim": 0.7,
+        "max_entries": 5000,
+    },
+    # Omega: MoA 竞技场 (困难任务并行多模型竞赛, 评审选冠军)
+    "moa": {
+        "enabled": False,
+        "tiers": ["hard"],   # 只对困难档开赛
+        "fanout": 3,
     },
     "stats": {"db_path": "router_stats.db"},
 }

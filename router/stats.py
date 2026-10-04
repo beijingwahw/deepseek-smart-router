@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS requests (
     baseline_standard_usd REAL NOT NULL DEFAULT 0,  -- 若全走 standard 档的成本
     latency_ms INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,        -- ok / fallback / error
-    error TEXT
+    error TEXT,
+    query TEXT                   -- 用户问题摘要 (供经验回忆/反馈引用)
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 """
@@ -48,23 +49,30 @@ class Stats:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # 老库迁移: v3 新增 query 列
+            cols = {r[1] for r in self._conn.execute(
+                "PRAGMA table_info(requests)").fetchall()}
+            if "query" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE requests ADD COLUMN query TEXT")
             self._conn.commit()
 
     def record(self, *, tier: str, model: str, score: int, reasons: str,
                prompt_tokens: int, completion_tokens: int, cost: float,
                baseline_hard: float, baseline_standard: float,
-               latency_ms: int, status: str, error: str | None = None) -> int:
+               latency_ms: int, status: str, error: str | None = None,
+               query: str = "") -> int:
         """记录一次请求, 返回 request_id (供反馈闭环引用)."""
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO requests
                    (ts, tier, model, score, reasons, prompt_tokens,
                     completion_tokens, cost_usd, baseline_hard_usd,
-                    baseline_standard_usd, latency_ms, status, error)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    baseline_standard_usd, latency_ms, status, error, query)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (time.time(), tier, model, score, reasons, prompt_tokens,
                  completion_tokens, cost, baseline_hard, baseline_standard,
-                 latency_ms, status, error),
+                 latency_ms, status, error, query[:2000]),
             )
             self._conn.commit()
             return cur.lastrowid

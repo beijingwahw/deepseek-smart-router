@@ -1,8 +1,16 @@
-# DeepSeek Smart Router · v2.0 Frontier
+# DeepSeek Smart Router · v3.0 Omega
 
-> 为 Agent Harness CLI 打造的**自我进化**多模型智能路由 —— 前沿研究落地的三层省钱防御：**语义缓存 → 级联升级 → 预测式最适配路由**，并从每次调用结果中持续学习，越用越准。
+> 为 Agent Harness CLI 打造的**自我进化**多模型智能路由 —— 三层省钱防御（缓存/级联/路由）之上，再加**经验回忆、模型竞技场、质量成本拨盘**，把每一次调用都变成系统的养料。
 
-## v2.0 Frontier: 前沿研究落地的三层防御
+## v3.0 Omega: 三大新前沿能力
+
+| 能力 | 前沿依据 | 实现 | 实测 |
+|------|----------|------|------|
+| 🧬 **kNN 经验回忆** | RouteLLM 语义路由器：相似历史任务的成败应指导当下路由 | 每次调用把（问题向量， 模型， 奖励）入库；新请求检索 top-k 相似经验，±15 分回忆加成直接改变派单 | "Redis 缓存穿透怎么解决啊？" → ds-v3 获得 +1.0 回忆加成（54→69 分）,Claude 被压到 30 分；新问题完全不受影响 |
+| ⚔️ **MoA 竞技场** | Mixture-of-Agents (ICLR 2025 Spotlight) 超 GPT-4o;Princeton 2025: 提议者质量>多样性 | 困难档并行 fan-out Top-N 模型，内置评审选冠军；**胜负反哺学习引擎（竞赛学习）**，冠军 +0.9 / 败者 +0.3 | 评审拒答型答案 0.1 分、完整答案 1.0 分，异常参赛者自动出局不拖垮全场 |
+| 🎛️ **λ 质量-成本拨盘** | 研究共识：路由本质是 quality-cost Pareto 上的 λ 权衡 | `routing.quality_lambda`: 0=极限省钱 / 1=极限质量，默认 0.55 平衡 | λ=1 时 Claude 居首，λ=0 时最贵模型殿后，一键切换人格 |
+
+## v2.0 Frontier: 三层省钱防御
 
 基于 RouteLLM (ICLR 2025)、FrugalGPT (TMLR)、GPTCache/SISO (2025)、GPT-5 混合路由架构的深度分析，本项目实现了学术界与工业界验证有效的完整省钱链路：
 
@@ -140,14 +148,16 @@ Harness CLI ──OpenAI 兼容──> Smart Router (FastAPI, :8355)
 | `router/classifier.py` | 难度评分（0-100) + 任务类型识别，每个信号记录理由，决策可解释 |
 | `router/matcher.py` | 能力匹配器：任务画像 × 模型能力画像 → 适配度（0-100)，内置常见模型画像 |
 | `router/learner.py` | 学习引擎：Thompson Sampling 反馈闭环，SQLite 持久化 |
-| `router/cache.py` | **语义缓存**: 向量相似命中 + 档位硬边界 + TTL + LRU 淘汰 |
+| `router/memory.py` | **kNN 经验回忆**: 相似历史任务检索，±15 分回忆加成 |
+| `router/moa.py` | **MoA 竞技场**: 并行 fan-out + 评审选冠军 + 竞赛学习 |
+| `router/cache.py` | 语义缓存：向量相似命中 + 档位硬边界 + TTL + LRU 淘汰 |
 | `router/embedder.py` | 向量化：内置零依赖哈希 n-gram / 可插拔 API embedding |
-| `router/judge.py` | **级联评审**: 拒答/过短/错误/重复/任务契合五维判分 |
+| `router/judge.py` | 级联评审：拒答/过短/错误/重复/任务契合五维判分 |
 | `router/budget.py` | 预算守卫：日限额超限自动降档/拒绝 |
 | `router/providers.py` | 协议适配层：4 类协议族的请求/响应/流式翻译 |
-| `router/proxy.py` | 候选链调度：best_fit×学习系数、单模型熔断、跨档降级、SSE 翻译透传 |
-| `router/stats.py` | SQLite 持久化：token/成本/基线差额/延迟，request_id 追踪 |
-| `router/main.py` | 三层防御编排 + 全部端点 + 配置热重载 + 运行时管理 |
+| `router/proxy.py` | 候选链调度：best_fit×学习系数×回忆加成×λ 拨盘，熔断降级，SSE 透传 |
+| `router/stats.py` | SQLite 持久化：token/成本/基线差额/延迟/问题摘要，request_id 追踪 |
+| `router/main.py` | 三层防御+竞技场编排 + 全部端点 + 热重载 + 运行时管理 |
 
 ## 最适配分配是如何工作的
 
@@ -214,14 +224,14 @@ models:
 ## 测试
 
 ```bash
-python -m pytest tests/ -q   # 92 个用例: 分类器 / 任务画像 / 能力匹配 / 学习引擎 /
-                             # 语义缓存 / 级联评审 / 预算守卫 / 协议翻译 / 成本计算
+python -m pytest tests/ -q   # 101 个用例: 分类器 / 能力匹配 / 学习引擎 / 语义缓存 /
+                             # 级联评审 / 经验回忆 / MoA 竞技场 / λ 拨盘 / 协议翻译 ...
 ```
 
 ## 路线图
 
-- [ ] 语义路由增强： 缓存向量复用为 kNN 经验回忆 (相似历史任务的反馈指导路由)
 - [ ] SISO 式聚类质心缓存, 提升泛化命中率
-- [ ] LLM-as-Judge 可选评审器 (用小模型替代启发式, 级联判分更准)
-- [ ] 按 Harness 会话维度聚合成本报表
+- [ ] LLM-as-Judge 可选评审器 (用小模型替代启发式, 级联/MoA 判分更准)
+- [ ] LLMLingua 提示词压缩 (>1000 tokens 的长上下文场景, 省 50-80% 输入)
+- [ ] MoA 聚合器模式 (冠军答案+其他提案合成最终答案, 而非单纯选拔)
 - [ ] A/B 影子模式: 新模型小流量灰度, 学习数据够了再转正

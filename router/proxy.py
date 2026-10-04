@@ -71,12 +71,13 @@ class RouteResult:
 
 class SmartRouter:
     def __init__(self, cfg: dict, client: httpx.AsyncClient | None = None,
-                 learner=None):
+                 learner=None, memory=None):
         self.cfg = cfg
         self.providers = cfg["providers"]
         self.models = cfg["models"]
         self.routing = cfg["routing"]
         self.learner = learner          # Genesis: 自适应学习引擎 (可选)
+        self.memory = memory            # Omega: kNN 经验回忆 (可选)
         self.disabled: set[str] = set()  # 运行时禁用 (Admin API)
         cb_cfg = self.routing.get("circuit_breaker", {})
         self.breakers = {
@@ -101,29 +102,54 @@ class SmartRouter:
              for m in enabled_models(self.cfg).values()),
             default=0.0)
 
+    def _weights(self) -> tuple[float, float, float]:
+        """λ 质量-成本拨盘: λ∈[0,1], 越大越重质量, 越小越重成本.
+
+        λ=0.55 时对应 (0.60, 0.25, 0.15) 平衡默认;
+        λ=0 时成本权重 0.425 (极限省钱), λ=1 时成本权重归零 (极限质量).
+        """
+        lam = max(0.0, min(1.0, float(self.routing.get("quality_lambda", 0.55))))
+        w_cap = 0.325 + 0.5 * lam
+        w_tier = 0.25
+        w_cost = max(0.0, 0.425 - 0.5 * lam)
+        total = w_cap + w_tier + w_cost
+        return w_cap / total, w_tier / total, w_cost / total
+
     def _suitability(self, name: str, task: dict, task_tier: str,
-                     max_price: float) -> tuple[float | None, dict]:
+                     max_price: float, recalled: dict | None = None
+                     ) -> tuple[float | None, dict]:
         m = self.models[name]
+        w_cap, w_tier, w_cost = self._weights()
         score, detail = suitability(caps_for(m), m.get("tier", "standard"),
                                     m.get("price", {}), task, max_price,
-                                    task_tier)
-        if score is not None and self.learner is not None:
+                                    task_tier, w_cap, w_tier, w_cost)
+        if score is None:
+            return score, detail
+        if self.learner is not None:
             adj = self.learner.adjustment(name, task.get("tags") or [])
             detail["learned_adjustment"] = adj
             if adj != 1.0:
-                score = round(min(100.0, score * adj), 1)
-        return score, detail
+                score = min(100.0, score * adj)
+        if self.memory is not None and recalled is not None:
+            bonus = self.memory.bonus(name, recalled)
+            detail["recall_bonus"] = bonus
+            if bonus != 0.0:
+                score = max(0.0, min(100.0, score + 15.0 * bonus))
+        return round(score, 1), detail
 
-    def candidates(self, tier: str, task: dict | None = None) -> list[str]:
-        """某难度档的启用模型, 按策略排序 (best_fit 时按任务适配度)."""
+    def candidates(self, tier: str, task: dict | None = None,
+                   query: str = "") -> list[str]:
+        """某难度档的启用模型, 按策略排序 (best_fit 时按任务适配度+回忆)."""
         names = [n for n, m in enabled_models(self.cfg).items()
                  if m.get("tier") == tier and n not in self.disabled]
         strategy = self.routing.get("strategy", "best_fit")
         if strategy == "best_fit" and task is not None:
             max_price = self._max_price()
+            recalled = (self.memory.recall(query)
+                        if self.memory is not None and query else None)
             scored = []
             for n in names:
-                s, _ = self._suitability(n, task, tier, max_price)
+                s, _ = self._suitability(n, task, tier, max_price, recalled)
                 scored.append((n, s if s is not None else -1.0))
             names = [n for n, _ in sorted(scored, key=lambda x: -x[1])]
         elif strategy == "cheapest":
@@ -140,23 +166,27 @@ class SmartRouter:
         return names
 
     def candidate_chain(self, tier: str, pinned: str | None = None,
-                        task: dict | None = None) -> list[str]:
+                        task: dict | None = None, query: str = "") -> list[str]:
         """完整候选链: 指定模型 / 同档模型 + 跨档降级模型."""
         if pinned:
             return [pinned]
-        chain = list(self.candidates(tier, task))
+        chain = list(self.candidates(tier, task, query))
         if self.routing.get("fallback_enabled", True):
             for fb_tier in self.routing.get("cross_tier_fallback", {}).get(tier, []):
-                chain += [n for n in self.candidates(fb_tier, task)
+                chain += [n for n in self.candidates(fb_tier, task, query)
                           if n not in chain]
         return chain
 
-    def suitability_report(self, tier: str, task: dict) -> list[dict]:
+    def suitability_report(self, tier: str, task: dict,
+                           query: str = "") -> list[dict]:
         """全池适配度报告 (供 preview 展示): 含被硬过滤的模型及原因."""
         max_price = self._max_price()
+        recalled = (self.memory.recall(query)
+                    if self.memory is not None and query else None)
         report = []
         for name, m in enabled_models(self.cfg).items():
-            score, detail = self._suitability(name, task, tier, max_price)
+            score, detail = self._suitability(name, task, tier, max_price,
+                                              recalled)
             report.append({
                 "name": name, "provider": m["provider"], "model": m["model"],
                 "tier": m.get("tier"), "score": score, **detail,

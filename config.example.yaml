@@ -13,6 +13,7 @@ thresholds:
 
 routing:
   strategy: best_fit            # best_fit(任务类型x能力画像, 推荐) | priority | cheapest | round_robin
+  quality_lambda: 0.55          # λ 质量-成本拨盘: 0=极限省钱, 1=极限质量
   fallback_enabled: true        # 失败时沿候选链降级
   cross_tier_fallback:          # 某档全挂时的跨档降级顺序
     hard: [standard]
@@ -174,6 +175,21 @@ aliases:
 # cascade:
 #   enabled: true
 #   judge_threshold: 0.55    # 评审分低于此值即升级
+
+# ---------------- kNN 经验回忆 (Omega, RouteLLM 语义路由路线) ----------------
+# 每次调用存"经验", 新请求检索相似经验: 上次谁答得好, 这次优先派谁
+# memory:
+#   enabled: true
+#   k: 5                   # 检索最相似的 k 条经验
+#   min_sim: 0.7           # 相似度下限
+#   max_entries: 5000
+
+# ---------------- MoA 竞技场 (Omega, Mixture-of-Agents) ----------------
+# 困难任务并行派出 Top-N 模型竞赛, 内置评审选冠军, 胜负反哺学习引擎
+# moa:
+#   enabled: true
+#   tiers: [hard]          # 只对困难档开赛 (成本考虑)
+#   fanout: 3              # 参赛模型数
 
 stats:
   db_path: router_stats.db   # 请求统计与学习数据共用此库
