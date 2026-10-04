@@ -1,12 +1,21 @@
-# DeepSeek Smart Router
+# DeepSeek Smart Router · v1.0 Genesis
 
-> 为 Agent Harness CLI 打造的多模型智能路由插件 —— 按任务难度在**你所有的 API 供应商**之间自动调度，省钱不降质。
+> 为 Agent Harness CLI 打造的**自我进化**多模型智能路由 —— 按任务画像在你所有的 API 供应商之间做最适配分配，并从每次调用结果中持续学习，越用越准。
+
+## v1.0 Genesis: 从静态路由到自我进化
+
+| 支柱 | 说明 |
+|------|------|
+| 🧠 **学习闭环** | Thompson Sampling: 每个 (模型×任务标签) 维护 Beta 分布，调用成功/失败自动反哺调度（隐式）,`POST /v1/feedback` 显式打分；好评模型最多放大 1.5x，差评最多压到 0.5x,SQLite 持久化重启不丢 |
+| 💰 **预算守卫** | 日花费限额，超限自动把困难档降为标准档（或直接 429)，看板实时用量条 |
+| 🔧 **运行时管理** | `/v1/admin` 免重启启停模型；配置文件保存即热重载，学习成果与禁用状态保留 |
+| 📊 **可观测 2.0** | 看板新增学习胜率、平均延迟、预算用量；每次响应带 `request_id` 供反馈引用 |
 
 ## 解决什么问题
 
-用 Harness 跑模型的用户有两个痛点：**全程挂旗舰模型太贵，全程挂便宜模型怕复杂任务翻车**；而且手里往往同时有 DeepSeek、OpenAI、Claude、Gemini 等多家 Key，却没有工具能把它们当成一个整体调度。
+用 Harness 跑模型的用户有三个痛点：**全程挂旗舰模型太贵，全程挂便宜模型怕翻车；手握多家 Key 却无法整体调度；静态规则不知道哪个模型在你的真实任务上表现好**。
 
-Smart Router 以本地代理形式接入任意 OpenAI 兼容的 Harness(aider / opencode / continue / 自研 harness),把**所有供应商的模型注册进同一个池子**，对每次请求实时评估难度，路由到性价比最高的可用模型。
+Smart Router 以本地代理形式接入任意 OpenAI 兼容的 Harness(aider / opencode / continue / 自研 harness),把所有供应商的模型注册进同一个池子：**任务画像 × 能力画像 × 学习反馈**三重信号决定派单。
 
 ## 支持的供应商
 
@@ -63,16 +72,20 @@ aider --model openai/auto      # auto=按难度路由; 也可写 smart / ds-r1 �
 ## 使用方式
 
 ```bash
-# 干跑: 查看路由计划 (分数/档位/候选链/熔断状态)
+# 干跑: 查看路由计划 (任务画像/适配度分解/学习系数/出局原因)
 curl localhost:8355/v1/route/preview -H 'Content-Type: application/json' -d '{
   "model":"auto",
   "messages":[{"role":"user","content":"设计一个百万并发的订单系统架构, 分析权衡"}]}'
-# => {"score":65,"tier":"hard","candidates":[{"name":"ds-r1",...},{"name":"ds-v3",...}],...}
 
-# harness 可选的模型列表 (别名 + 池内名称)
-curl localhost:8355/v1/models
+# 显式反馈: 让调度越用越准 (响应里的 router.request_id 直接引用)
+curl localhost:8355/v1/feedback -H 'Content-Type: application/json' -d '{
+  "request_id": 42, "score": 0.9}'
 
-# 成本统计
+# 运行时管理: 免重启禁用/启用模型
+curl -X POST localhost:8355/v1/admin/models/ds-r1/disable
+curl localhost:8355/v1/admin/models
+
+# 成本统计 + 学习状态 + 延迟 + 预算
 curl localhost:8355/v1/stats
 ```
 
@@ -101,10 +114,12 @@ Harness CLI ──OpenAI 兼容──> Smart Router (FastAPI, :8355)
 |------|------|
 | `router/classifier.py` | 难度评分（0-100) + 任务类型识别，每个信号记录理由，决策可解释 |
 | `router/matcher.py` | 能力匹配器：任务画像 × 模型能力画像 → 适配度（0-100)，内置常见模型画像 |
+| `router/learner.py` | **学习引擎**: Thompson Sampling 反馈闭环，SQLite 持久化 |
+| `router/budget.py` | **预算守卫**: 日限额超限自动降档/拒绝 |
 | `router/providers.py` | 协议适配层：4 类协议族的请求/响应/流式翻译 |
-| `router/proxy.py` | 候选链调度：best_fit 适配排序、单模型熔断、跨档降级、SSE 翻译透传 |
-| `router/stats.py` | SQLite 持久化，逐笔记录 token/成本/基线差额 |
-| `router/main.py` | `/v1/chat/completions`、`/v1/models`、`/v1/route/preview`、`/v1/stats`、`/dashboard` |
+| `router/proxy.py` | 候选链调度：best_fit×学习系数、单模型熔断、跨档降级、SSE 翻译透传 |
+| `router/stats.py` | SQLite 持久化：token/成本/基线差额/延迟，request_id 追踪 |
+| `router/main.py` | 全部端点 + 配置热重载 + 运行时管理 |
 
 ## 最适配分配是如何工作的
 
@@ -171,13 +186,13 @@ models:
 ## 测试
 
 ```bash
-python -m pytest tests/ -q   # 61 个用例: 分类器 / 任务画像 / 能力匹配 / 候选链调度 /
-                             # 熔断降级 / Anthropic·Gemini·Azure 协议翻译 / 成本计算
+python -m pytest tests/ -q   # 74 个用例: 分类器 / 任务画像 / 能力匹配 / 学习引擎 /
+                             # 预算守卫 / 候选链调度 / 熔断降级 / 协议翻译 / 成本计算
 ```
 
 ## 路线图
 
-- [ ] 基于历史反馈的自学习阈值 (bandit 算法动态调 trivial/hard 分界线)
 - [ ] 小型 Embedding 分类器作为启发式的可选增强
 - [ ] 按 Harness 会话维度聚合成本报表
-- [ ] 延迟感知调度 (实测 TTFT 参与候选排序)
+- [ ] TTFT/吞吐实测参与适配度 (延迟维度学习)
+- [ ] A/B 影子模式: 新模型小流量灰度, 学习数据够了再转正

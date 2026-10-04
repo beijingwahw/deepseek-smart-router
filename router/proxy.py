@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .config import enabled_models
+from .learner import REWARD_FAILURE, REWARD_SUCCESS
 from .matcher import caps_for, suitability
 from .providers import build_adapter
 
@@ -69,11 +70,14 @@ class RouteResult:
 
 
 class SmartRouter:
-    def __init__(self, cfg: dict, client: httpx.AsyncClient | None = None):
+    def __init__(self, cfg: dict, client: httpx.AsyncClient | None = None,
+                 learner=None):
         self.cfg = cfg
         self.providers = cfg["providers"]
         self.models = cfg["models"]
         self.routing = cfg["routing"]
+        self.learner = learner          # Genesis: 自适应学习引擎 (可选)
+        self.disabled: set[str] = set()  # 运行时禁用 (Admin API)
         cb_cfg = self.routing.get("circuit_breaker", {})
         self.breakers = {
             name: CircuitBreaker(cb_cfg.get("failure_threshold", 3),
@@ -100,13 +104,20 @@ class SmartRouter:
     def _suitability(self, name: str, task: dict, task_tier: str,
                      max_price: float) -> tuple[float | None, dict]:
         m = self.models[name]
-        return suitability(caps_for(m), m.get("tier", "standard"),
-                           m.get("price", {}), task, max_price, task_tier)
+        score, detail = suitability(caps_for(m), m.get("tier", "standard"),
+                                    m.get("price", {}), task, max_price,
+                                    task_tier)
+        if score is not None and self.learner is not None:
+            adj = self.learner.adjustment(name, task.get("tags") or [])
+            detail["learned_adjustment"] = adj
+            if adj != 1.0:
+                score = round(min(100.0, score * adj), 1)
+        return score, detail
 
     def candidates(self, tier: str, task: dict | None = None) -> list[str]:
         """某难度档的启用模型, 按策略排序 (best_fit 时按任务适配度)."""
         names = [n for n, m in enabled_models(self.cfg).items()
-                 if m.get("tier") == tier]
+                 if m.get("tier") == tier and n not in self.disabled]
         strategy = self.routing.get("strategy", "best_fit")
         if strategy == "best_fit" and task is not None:
             max_price = self._max_price()
@@ -181,9 +192,14 @@ class SmartRouter:
         """4xx 是请求本身的问题, 换模型大概率同样失败, 不值得降级."""
         return not (isinstance(e, UpstreamError) and e.message.startswith("上游 4"))
 
+    def _learn(self, name: str, task: dict | None, reward: float) -> None:
+        if self.learner is not None:
+            self.learner.record(name, (task or {}).get("tags") or [], reward)
+
     # ---------- 非流式 ----------
 
-    async def chat(self, chain: list[str], payload: dict) -> RouteResult:
+    async def chat(self, chain: list[str], payload: dict,
+                   task: dict | None = None) -> RouteResult:
         if not chain:
             raise UpstreamError("-", "模型池为空: 没有可用模型")
         last_err: Exception | None = None
@@ -204,6 +220,7 @@ class SmartRouter:
                 if resp.status_code >= 500:
                     raise UpstreamError(name, f"上游 {resp.status_code}")
                 self.breakers[name].on_success()  # 4xx 也算上游可达
+                self._learn(name, task, REWARD_SUCCESS)
                 data = adapter.translate_response(resp.json())
                 result = self._result(name, chain, started,
                                       usage=data.get("usage", {}) or {},
@@ -213,6 +230,7 @@ class SmartRouter:
                 return result
             except (httpx.TimeoutException, httpx.TransportError, UpstreamError) as e:
                 self.breakers[name].on_failure()
+                self._learn(name, task, REWARD_FAILURE)
                 last_err = e
                 if not self._transient(e):
                     raise
@@ -220,7 +238,8 @@ class SmartRouter:
 
     # ---------- 流式 ----------
 
-    async def chat_stream(self, chain: list[str], payload: dict):
+    async def chat_stream(self, chain: list[str], payload: dict,
+                          task: dict | None = None):
         """返回 (RouteResult, 异步字节迭代器, usage_holder).
 
         流式只在连接建立阶段降级; 建立后事件流经协议翻译器转为 OpenAI 格式透传.
@@ -246,12 +265,14 @@ class SmartRouter:
                     await resp.aclose()
                     raise UpstreamError(name, f"上游 {resp.status_code}")
                 self.breakers[name].on_success()
+                self._learn(name, task, REWARD_SUCCESS)
                 usage_holder: dict = {}
                 stream = self._wrap_stream(resp, adapter.make_stream_translator(),
                                            usage_holder)
                 return self._result(name, chain, started), stream, usage_holder
             except (httpx.TimeoutException, httpx.TransportError, UpstreamError) as e:
                 self.breakers[name].on_failure()
+                self._learn(name, task, REWARD_FAILURE)
                 last_err = e
                 if not self._transient(e):
                     raise

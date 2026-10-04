@@ -152,5 +152,11 @@ aliases:
   reasoning: hard
   default: standard       # 锁定标准档
 
+# ---------------- 预算守卫 (Genesis) ----------------
+# budget:
+#   enabled: true
+#   daily_usd: 10.0          # 日花费上限 (按 price 表核算)
+#   on_exceed: downgrade     # downgrade(困难档自动降标准档) | block(直接 429)
+
 stats:
-  db_path: router_stats.db
+  db_path: router_stats.db   # 请求统计与学习数据共用此库

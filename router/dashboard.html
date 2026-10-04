@@ -59,6 +59,20 @@
   <div class="legend" id="tierCounts"></div>
 </div>
 
+<div class="section" id="budgetSection" style="display:none">
+  <h2>预算守卫</h2>
+  <div class="bars" style="background:#222"><div class="bar" id="budgetBar" style="background:#3fb950;width:0%"></div></div>
+  <div class="legend" id="budgetText"></div>
+</div>
+
+<div class="section">
+  <h2>学习状态 (Thompson Sampling 自适应)</h2>
+  <table>
+    <thead><tr><th>模型</th><th>学习胜率</th><th>反馈次数</th><th>平均延迟</th><th>调用数</th></tr></thead>
+    <tbody id="learnRows"></tbody>
+  </table>
+</div>
+
 <div class="section">
   <h2>最近路由决策</h2>
   <table>
@@ -89,6 +103,29 @@ async function refresh() {
       `<div class="bar bar-${k}" style="width:${((t[k]||0)/total*100).toFixed(1)}%"></div>`).join('');
     $('tierCounts').textContent =
       `trivial ${t.trivial||0} 次 · standard ${t.standard||0} 次 · hard ${t.hard||0} 次`;
+
+    // 预算守卫
+    const b = d.budget || {};
+    if (b.enabled && b.daily_usd > 0) {
+      $('budgetSection').style.display = 'block';
+      const pct = Math.min(100, (b.spent_today / b.daily_usd) * 100);
+      $('budgetBar').style.width = pct + '%';
+      $('budgetBar').style.background = pct > 90 ? '#f85149' : pct > 70 ? '#d29922' : '#3fb950';
+      $('budgetText').textContent =
+        `今日已用 $${(b.spent_today||0).toFixed(4)} / $${b.daily_usd} (${pct.toFixed(1)}%) · 超限策略: ${b.on_exceed||'downgrade'}`;
+    }
+
+    // 学习状态
+    const learner = d.learner || {}, latency = d.latency || {};
+    const models = new Set([...Object.keys(learner), ...Object.keys(latency)]);
+    $('learnRows').innerHTML = [...models].map(m => {
+      const l = learner[m] || {}, lat = latency[m] || {};
+      const wr = l.win_rate !== undefined ? (l.win_rate*100).toFixed(0)+'%' : '-';
+      const color = l.win_rate >= 0.7 ? '#3fb950' : l.win_rate >= 0.4 ? '#d29922' : '#f85149';
+      return `<tr><td>${m}</td>
+        <td style="color:${color};font-weight:600">${wr}</td>
+        <td>${l.trials||0}</td><td>${lat.avg_latency_ms||0}ms</td><td>${lat.calls||0}</td></tr>`;
+    }).join('') || '<tr><td colspan="5" style="color:#8b98a5">暂无学习数据 —— 调用几次或 POST /v1/feedback 后, 这里会显示每个模型的学习胜率</td></tr>';
 
     $('rows').innerHTML = (d.recent||[]).map(r => {
       const dt = new Date(r.ts*1000).toLocaleTimeString('zh-CN', {hour12:false});
