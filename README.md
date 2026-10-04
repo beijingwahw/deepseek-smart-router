@@ -22,6 +22,8 @@ Smart Router 以本地代理形式接入任意 OpenAI 兼容的 Harness(aider / 
 ## 核心特性
 
 - **多供应商模型池**: 每个模型声明 `tier`(trivial/standard/hard 难度档)、`priority`、`price`,同档可多模型互为备份
+- **最适配分配 (best_fit)**: 识别任务类型（代码/数学/推理/翻译/写作/长上下文）× 每个模型的能力画像，计算适配度得分，把任务交给池里**最适合**的模型，而不是机械地按档位派单
+- **硬过滤保障**: 视觉任务自动排除纯文本模型、超长上下文自动排除小窗口模型、工具调用任务自动排除不支持 tools 的模型——杜绝"派错人"
 - **零成本难度分类器**: 纯启发式多信号评分（推理关键词、堆栈信息、编码意图、上下文规模、对话深度、工具调用链），不额外调用模型，零延迟
 - **三种寻路方式**:
   - `model: "auto"`（或任意未知名）→ 按难度自动路由
@@ -29,7 +31,7 @@ Smart Router 以本地代理形式接入任意 OpenAI 兼容的 Harness(aider / 
   - 直接写池内名称（如 `ds-r1`)→ 锁定该模型，**显式选择永远优先**
 - **消息级控制**: 消息里加 `[think]` 强制困难档，`[quick]` 强制简单档
 - **单模型熔断 + 候选链降级**: 某模型连续失败 3 次熔断 60 秒，期间自动沿候选链（同档备选 → 跨档降级）切换，任务不中断
-- **调度策略**: `priority`（按优先级）/ `cheapest`（最便宜优先）/ `round_robin`（轮询）
+- **调度策略**: `best_fit`（任务×能力最适配，默认推荐）/ `priority` / `cheapest` / `round_robin`
 - **流式协议翻译**: Anthropic/Gemini 的 SSE 事件流实时转 OpenAI chunk 格式，harness 无感知
 - **实时成本看板**: 内置 `/dashboard`，按 `provider/model` 展示每笔路由决策、实际花费、对比"全走最贵档"省下的金额
 - **干跑模式**: `/v1/route/preview` 只看决策不发请求，含完整候选链和熔断状态
@@ -97,11 +99,50 @@ Harness CLI ──OpenAI 兼容──> Smart Router (FastAPI, :8355)
 
 | 文件 | 职责 |
 |------|------|
-| `router/classifier.py` | 难度评分（0-100)，每个信号记录理由，决策可解释 |
+| `router/classifier.py` | 难度评分（0-100) + 任务类型识别，每个信号记录理由，决策可解释 |
+| `router/matcher.py` | 能力匹配器：任务画像 × 模型能力画像 → 适配度（0-100)，内置常见模型画像 |
 | `router/providers.py` | 协议适配层：4 类协议族的请求/响应/流式翻译 |
-| `router/proxy.py` | 候选链调度：策略排序、单模型熔断、跨档降级、SSE 翻译透传 |
+| `router/proxy.py` | 候选链调度：best_fit 适配排序、单模型熔断、跨档降级、SSE 翻译透传 |
 | `router/stats.py` | SQLite 持久化，逐笔记录 token/成本/基线差额 |
 | `router/main.py` | `/v1/chat/completions`、`/v1/models`、`/v1/route/preview`、`/v1/stats`、`/dashboard` |
+
+## 最适配分配是如何工作的
+
+```
+任务 ──> 任务画像: {类型标签, 输入规模, 硬性需求(视觉/工具)}
+              │
+              ▼
+   1. 硬过滤: 需要视觉但模型不支持? 出局
+              输入 50k tokens 但窗口 32k? 出局
+              需要工具调用但模型不支持? 出局
+              ▼
+   2. 适配度 = 0.60×能力匹配 + 0.25×档位契合 + 0.15×成本契合(对数曲线)
+              ▼
+   3. 候选链按适配度排序, 逐一下发, 失败自动降级
+```
+
+内置画像覆盖 DeepSeek / GPT / Claude / Gemini / Qwen / GLM / Kimi / Llama 等常见模型（按模型 ID 自动匹配）;接入新模型时在 YAML 里声明即可：
+
+```yaml
+models:
+  my-model:
+    provider: openrouter
+    model: some/new-model
+    tier: standard
+    price: { input: 0.5, output: 1.5 }
+    strengths: { reasoning: 8, math: 7, code: 9, writing: 6, translation: 6, long_context: 5 }
+    context_window: 131072
+    supports_tools: true
+    supports_vision: false
+```
+
+实测示例（DeepSeek + Claude + Gemini + Qwen + 本地七模型池）:
+
+| 任务 | 首选模型 | 说明 |
+|------|----------|------|
+| "证明根号 2 是无理数并推导连分数" | deepseek-reasoner （适配度 82) | 推理能力 10/10 居首 |
+| "识别这张截图里的错误" | gemini-2.0-flash | 纯文本模型全部出局 |
+| "写一篇 2000 字小红书文案" | gemini-2.0-flash | 简单任务+写作强项+便宜 |
 
 ## 配置
 
@@ -130,8 +171,8 @@ models:
 ## 测试
 
 ```bash
-python -m pytest tests/ -q   # 39 个用例: 分类器 / 候选链调度 / 熔断降级 /
-                             # Anthropic·Gemini·Azure 协议翻译 / 成本计算
+python -m pytest tests/ -q   # 61 个用例: 分类器 / 任务画像 / 能力匹配 / 候选链调度 /
+                             # 熔断降级 / Anthropic·Gemini·Azure 协议翻译 / 成本计算
 ```
 
 ## 路线图

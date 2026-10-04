@@ -16,7 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .classifier import classify, route
+from .classifier import classify, detect_task_profile, route
 from .config import enabled_models, load_config
 from .proxy import SmartRouter, UpstreamError
 from .stats import Stats, calc_cost
@@ -96,17 +96,19 @@ async def list_models():
 
 @app.post("/v1/route/preview")
 async def route_preview(request: Request):
-    """干跑模式: 只返回路由计划, 不调用上游 —— 调阈值、看理由都靠它."""
+    """干跑模式: 只返回路由计划, 不调用上游 —— 调阈值、看理由都靠它.
+
+    返回任务画像 (类型标签/硬性需求) + 全池适配度报告 (含被过滤模型及原因).
+    """
     payload = await request.json()
     tier, pinned, f = _plan(payload)
-    chain = router.candidate_chain(tier, pinned)
+    task = detect_task_profile(payload)
+    chain = router.candidate_chain(tier, pinned, task)
     return {
         "score": f.score, "tier": tier, "pinned": pinned,
-        "candidates": [
-            {"name": n, "provider": cfg["models"][n]["provider"],
-             "model": cfg["models"][n]["model"],
-             "breaker_open": not router.breakers[n].available()}
-            for n in chain],
+        "task_profile": task,
+        "candidates": [r for r in router.suitability_report(tier, task)
+                       if r["name"] in chain],
         "forced": f.forced, "reasons": f.reasons,
     }
 
@@ -115,7 +117,8 @@ async def route_preview(request: Request):
 async def chat_completions(request: Request):
     payload = await request.json()
     tier, pinned, f = _plan(payload)
-    chain = router.candidate_chain(tier, pinned)
+    task = detect_task_profile(payload)
+    chain = router.candidate_chain(tier, pinned, task)
     reasons = "; ".join(f.reasons) or "无显著信号"
 
     if payload.get("stream"):

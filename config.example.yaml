@@ -12,7 +12,7 @@ thresholds:
   hard: 60
 
 routing:
-  strategy: priority            # priority(按优先级) | cheapest(最便宜) | round_robin(轮询)
+  strategy: best_fit            # best_fit(任务类型x能力画像, 推荐) | priority | cheapest | round_robin
   fallback_enabled: true        # 失败时沿候选链降级
   cross_tier_fallback:          # 某档全挂时的跨档降级顺序
     hard: [standard]
@@ -88,6 +88,11 @@ providers:
 # ---------------- 模型池 ----------------
 # key: 内部名称 (harness 可直接指定); tier: 难度档; priority: 同档内越小越先用
 # price: 每百万 token 美元, 用于成本核算 (cache_hit_input 可选)
+# 能力画像: 内置常见模型画像自动生效; 新模型可用以下字段手动声明:
+#   strengths: { reasoning: 8, math: 7, code: 9, writing: 6, translation: 6, long_context: 5 }
+#   context_window: 131072
+#   supports_tools: true / false
+#   supports_vision: true / false
 models:
   local-qwen:
     provider: ollama

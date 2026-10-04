@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "server": {"host": "0.0.0.0", "port": 8355},
     "thresholds": {"trivial": 25, "hard": 60},
     "routing": {
-        # 同档内多模型的挑选策略: priority(按优先级) / cheapest(最便宜) / round_robin(轮询)
-        "strategy": "priority",
+        # 同档内多模型的挑选策略:
+        # best_fit(按任务类型x模型能力画像, 推荐) / priority / cheapest / round_robin
+        "strategy": "best_fit",
         "fallback_enabled": True,
         # 某档全部不可用时的跨档降级顺序
         "cross_tier_fallback": {
@@ -77,14 +79,16 @@ def _merge(base: dict, override: dict) -> dict:
 
 
 def load_config(path: str | os.PathLike | None = None) -> dict:
-    """加载配置文件, 缺失时用默认值. 环境变量 ROUTER_CONFIG 可指定路径."""
-    cfg = DEFAULT_CONFIG
+    """加载配置文件, 缺失时用默认值. 环境变量 ROUTER_CONFIG 可指定路径.
+
+    始终返回深拷贝, 调用方修改不会污染全局默认配置.
+    """
     path = path or os.environ.get("ROUTER_CONFIG")
     if path and Path(path).exists():
         with open(path, encoding="utf-8") as fh:
             user_cfg = yaml.safe_load(fh) or {}
-        cfg = _merge(DEFAULT_CONFIG, user_cfg)
-    return cfg
+        return _merge(copy.deepcopy(DEFAULT_CONFIG), user_cfg)
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def resolve_api_key(provider_cfg: dict) -> str:

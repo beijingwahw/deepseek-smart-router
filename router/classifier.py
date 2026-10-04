@@ -196,3 +196,62 @@ def route(score: int, threshold_trivial: int, threshold_hard: int) -> str:
     if score >= threshold_hard:
         return "hard"
     return "standard"
+
+
+# ---------------- 任务类型识别 (供能力匹配使用) ----------------
+
+MATH_RE = re.compile(
+    r"(数学|方程|积分|微分|导数|概率论|线性代数|矩阵|求极限|计算.{0,10}(值|结果)|"
+    r"\$\$|\\frac|\\sum|\\int|math|equation|integral|derivative|matrix|"
+    r"calculate|compute the)", re.IGNORECASE)
+WRITING_RE = re.compile(
+    r"(写一篇|写一首|作文|文案|演讲稿|发言稿|小说|诗歌|剧本|公众号|小红书|"
+    r"扩写|续写|write an? (essay|article|poem|story)|draft a|copywriting)",
+    re.IGNORECASE)
+TRANSLATE_RE = re.compile(r"(翻译|译成|译为|translate|translation)", re.IGNORECASE)
+VISION_RE = re.compile(
+    r"(这张图|这张图片|图片里|照片中|截图|识别图|ocr|图中|image|picture|"
+    r"screenshot)", re.IGNORECASE)
+
+TASK_TAGS = ["code", "math", "reasoning", "translation", "writing",
+             "long_context"]
+
+
+def detect_task_profile(payload: dict) -> dict:
+    """识别任务画像: 类型标签 + 上下文规模 + 硬性需求 (视觉/工具).
+
+    返回:
+      tags: 任务类型标签集合 (TASK_TAGS 的子集)
+      est_tokens: 估算的输入 token 数
+      needs_vision: 是否必须支持图像输入 (硬过滤条件)
+      needs_tools: 是否必须支持工具调用 (硬过滤条件)
+    """
+    messages = payload.get("messages", []) or []
+    full = _all_text(messages)
+    tags: set[str] = set()
+
+    if CODE_BLOCK_RE.search(full) or CODE_REQUEST_RE.search(full):
+        tags.add("code")
+    if MATH_RE.search(full):
+        tags.add("math")
+    if any(kw in full.lower() for kw in REASONING_KEYWORDS):
+        tags.add("reasoning")
+    if TRANSLATE_RE.search(full):
+        tags.add("translation")
+    if WRITING_RE.search(full):
+        tags.add("writing")
+
+    est_tokens = max(1, len(full) // 4)
+    if est_tokens > 16000:
+        tags.add("long_context")
+
+    needs_vision = VISION_RE.search(full) is not None or any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url"
+                for p in m["content"])
+        for m in messages)
+    needs_tools = bool(payload.get("tools") or payload.get("tool_choice")
+                       or any(m.get("role") == "tool" for m in messages))
+
+    return {"tags": sorted(tags), "est_tokens": est_tokens,
+            "needs_vision": needs_vision, "needs_tools": needs_tools}

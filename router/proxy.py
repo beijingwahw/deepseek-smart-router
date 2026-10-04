@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from .config import enabled_models
+from .matcher import caps_for, suitability
 from .providers import build_adapter
 
 
@@ -90,12 +91,31 @@ class SmartRouter:
 
     # ---------- 候选链 ----------
 
-    def candidates(self, tier: str) -> list[str]:
-        """某难度档的启用模型, 按策略排序."""
+    def _max_price(self) -> float:
+        return max(
+            (m["price"].get("input", 0) + m["price"].get("output", 0)
+             for m in enabled_models(self.cfg).values()),
+            default=0.0)
+
+    def _suitability(self, name: str, task: dict, task_tier: str,
+                     max_price: float) -> tuple[float | None, dict]:
+        m = self.models[name]
+        return suitability(caps_for(m), m.get("tier", "standard"),
+                           m.get("price", {}), task, max_price, task_tier)
+
+    def candidates(self, tier: str, task: dict | None = None) -> list[str]:
+        """某难度档的启用模型, 按策略排序 (best_fit 时按任务适配度)."""
         names = [n for n, m in enabled_models(self.cfg).items()
                  if m.get("tier") == tier]
-        strategy = self.routing.get("strategy", "priority")
-        if strategy == "cheapest":
+        strategy = self.routing.get("strategy", "best_fit")
+        if strategy == "best_fit" and task is not None:
+            max_price = self._max_price()
+            scored = []
+            for n in names:
+                s, _ = self._suitability(n, task, tier, max_price)
+                scored.append((n, s if s is not None else -1.0))
+            names = [n for n, _ in sorted(scored, key=lambda x: -x[1])]
+        elif strategy == "cheapest":
             names.sort(key=lambda n: (self.models[n]["price"].get("input", 0)
                                       + self.models[n]["price"].get("output", 0)))
         elif strategy == "round_robin":
@@ -108,15 +128,32 @@ class SmartRouter:
             names.sort(key=lambda n: self.models[n].get("priority", 1))
         return names
 
-    def candidate_chain(self, tier: str, pinned: str | None = None) -> list[str]:
+    def candidate_chain(self, tier: str, pinned: str | None = None,
+                        task: dict | None = None) -> list[str]:
         """完整候选链: 指定模型 / 同档模型 + 跨档降级模型."""
         if pinned:
             return [pinned]
-        chain = list(self.candidates(tier))
+        chain = list(self.candidates(tier, task))
         if self.routing.get("fallback_enabled", True):
             for fb_tier in self.routing.get("cross_tier_fallback", {}).get(tier, []):
-                chain += [n for n in self.candidates(fb_tier) if n not in chain]
+                chain += [n for n in self.candidates(fb_tier, task)
+                          if n not in chain]
         return chain
+
+    def suitability_report(self, tier: str, task: dict) -> list[dict]:
+        """全池适配度报告 (供 preview 展示): 含被硬过滤的模型及原因."""
+        max_price = self._max_price()
+        report = []
+        for name, m in enabled_models(self.cfg).items():
+            score, detail = self._suitability(name, task, tier, max_price)
+            report.append({
+                "name": name, "provider": m["provider"], "model": m["model"],
+                "tier": m.get("tier"), "score": score, **detail,
+                "breaker_open": not self.breakers[name].available(),
+            })
+        report.sort(key=lambda r: (r["score"] is None,
+                                   -(r["score"] or 0)))
+        return report
 
     # ---------- 内部 ----------
 
