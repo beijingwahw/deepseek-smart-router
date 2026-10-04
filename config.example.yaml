@@ -1,0 +1,151 @@
+# DeepSeek Smart Router 配置示例 (v2 多供应商模型池)
+# 用法: export ROUTER_CONFIG=config.yaml 后启动; 所有字段都有默认值
+# 想接入哪家就把对应 provider 取消注释、设好 API Key 环境变量、在 models 里启用即可
+
+server:
+  host: 0.0.0.0
+  port: 8355
+
+# 难度分阈值: <trivial 走简单档, >=hard 走困难档, 中间走标准档
+thresholds:
+  trivial: 25
+  hard: 60
+
+routing:
+  strategy: priority            # priority(按优先级) | cheapest(最便宜) | round_robin(轮询)
+  fallback_enabled: true        # 失败时沿候选链降级
+  cross_tier_fallback:          # 某档全挂时的跨档降级顺序
+    hard: [standard]
+    standard: [hard]
+    trivial: [standard]
+  circuit_breaker:
+    failure_threshold: 3        # 单模型连续失败 3 次熔断
+    cooldown_seconds: 60        # 60 秒后半开重试
+
+# ---------------- 供应商 (协议类型: openai / azure / anthropic / gemini) ----------------
+providers:
+  deepseek:
+    type: openai
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+
+  # openai:
+  #   type: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key_env: OPENAI_API_KEY
+
+  # anthropic:
+  #   type: anthropic             # 原生 Messages API, 自动协议翻译
+  #   base_url: https://api.anthropic.com
+  #   api_key_env: ANTHROPIC_API_KEY
+
+  # gemini:
+  #   type: gemini                # 原生 generateContent, 自动协议翻译
+  #   base_url: https://generativelanguage.googleapis.com/v1beta
+  #   api_key_env: GEMINI_API_KEY
+
+  # qwen:                         # 通义千问 (OpenAI 兼容模式)
+  #   type: openai
+  #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   api_key_env: DASHSCOPE_API_KEY
+
+  # glm:                          # 智谱 GLM
+  #   type: openai
+  #   base_url: https://open.bigmodel.cn/api/paas/v4
+  #   api_key_env: ZHIPU_API_KEY
+
+  # kimi:                         # 月之暗面
+  #   type: openai
+  #   base_url: https://api.moonshot.cn/v1
+  #   api_key_env: MOONSHOT_API_KEY
+
+  # openrouter:                   # 一个 key 接入数百个模型
+  #   type: openai
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+
+  # groq:                         # 超快推理, 有免费额度
+  #   type: openai
+  #   base_url: https://api.groq.com/openai/v1
+  #   api_key_env: GROQ_API_KEY
+
+  # mistral:
+  #   type: openai
+  #   base_url: https://api.mistral.ai/v1
+  #   api_key_env: MISTRAL_API_KEY
+
+  # azure:                        # Azure OpenAI (deployment 路径)
+  #   type: azure
+  #   base_url: https://YOUR-RESOURCE.openai.azure.com
+  #   api_key_env: AZURE_OPENAI_API_KEY
+  #   api_version: "2024-10-21"
+
+  ollama:                         # 本地模型, 零成本
+    type: openai
+    base_url: http://localhost:11434/v1
+    api_key: ollama               # 本地服务占位 key
+
+# ---------------- 模型池 ----------------
+# key: 内部名称 (harness 可直接指定); tier: 难度档; priority: 同档内越小越先用
+# price: 每百万 token 美元, 用于成本核算 (cache_hit_input 可选)
+models:
+  local-qwen:
+    provider: ollama
+    model: qwen2.5-coder:7b
+    tier: trivial
+    priority: 1
+    timeout: 60
+    price: { input: 0.0, output: 0.0 }
+
+  ds-v3:
+    provider: deepseek
+    model: deepseek-chat
+    tier: standard
+    priority: 1
+    timeout: 120
+    price: { input: 0.27, output: 1.10, cache_hit_input: 0.07 }
+
+  ds-r1:
+    provider: deepseek
+    model: deepseek-reasoner
+    tier: hard
+    priority: 1
+    timeout: 300
+    price: { input: 0.55, output: 2.19, cache_hit_input: 0.14 }
+
+  # 同档多模型示例: R1 熔断后自动用 Claude 顶困难档
+  # claude-sonnet:
+  #   provider: anthropic
+  #   model: claude-sonnet-4-5
+  #   tier: hard
+  #   priority: 2
+  #   timeout: 300
+  #   price: { input: 3.0, output: 15.0 }
+
+  # gpt-4o-mini:
+  #   provider: openai
+  #   model: gpt-4o-mini
+  #   tier: standard
+  #   priority: 2
+  #   timeout: 120
+  #   price: { input: 0.15, output: 0.60 }
+
+  # gemini-flash:
+  #   provider: gemini
+  #   model: gemini-2.0-flash
+  #   tier: trivial
+  #   priority: 2
+  #   timeout: 60
+  #   price: { input: 0.10, output: 0.40 }
+
+# ---------------- 别名: harness 请求里的 model 字段 ----------------
+aliases:
+  auto: auto              # 按难度自动路由 (默认)
+  cheap: trivial          # 锁定简单档
+  fast: trivial
+  smart: hard             # 锁定困难档
+  reasoning: hard
+  default: standard       # 锁定标准档
+
+stats:
+  db_path: router_stats.db

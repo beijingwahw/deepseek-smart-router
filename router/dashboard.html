@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSeek Smart Router · 成本看板</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f1419; color: #e6e6e6; padding: 24px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #8b98a5; font-size: 13px; margin-bottom: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #1a2029; border: 1px solid #2a3442; border-radius: 10px; padding: 16px; }
+  .card .label { font-size: 12px; color: #8b98a5; margin-bottom: 6px; }
+  .card .value { font-size: 24px; font-weight: 700; }
+  .green { color: #3fb950; } .blue { color: #58a6ff; } .orange { color: #d29922; } .red { color: #f85149; }
+  .bars { display: flex; height: 22px; border-radius: 6px; overflow: hidden; margin: 8px 0 4px; background: #222; }
+  .bar { height: 100%; transition: width .5s; }
+  .bar-trivial { background: #8b98a5; } .bar-standard { background: #58a6ff; } .bar-hard { background: #d29922; }
+  .legend { font-size: 12px; color: #8b98a5; margin-bottom: 24px; }
+  .legend span { margin-right: 16px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a3442; }
+  th { color: #8b98a5; font-weight: 500; }
+  .tag { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .tag-trivial { background: #2d333b; color: #adbac7; }
+  .tag-standard { background: #1c3d5a; color: #58a6ff; }
+  .tag-hard { background: #4d3a10; color: #d29922; }
+  .tag-error { background: #4d1a1a; color: #f85149; }
+  .reasons { color: #8b98a5; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  h2 { font-size: 15px; margin-bottom: 10px; color: #adbac7; }
+  .section { background: #1a2029; border: 1px solid #2a3442; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<h1>DeepSeek Smart Router</h1>
+<div class="sub">多模型智能路由 · 实时成本看板 · 每 5 秒自动刷新</div>
+
+<div class="cards">
+  <div class="card"><div class="label">总请求数</div><div class="value blue" id="n">-</div></div>
+  <div class="card"><div class="label">实际花费</div><div class="value" id="cost">-</div></div>
+  <div class="card"><div class="label">省下的钱 (vs 全走 R1)</div><div class="value green" id="savedH">-</div></div>
+  <div class="card"><div class="label">省下的钱 (vs 全走 V3)</div><div class="value green" id="savedS">-</div></div>
+  <div class="card"><div class="label">总 Token (入/出)</div><div class="value orange" id="tokens" style="font-size:16px">-</div></div>
+</div>
+
+<div class="section">
+  <h2>档位分布</h2>
+  <div class="bars" id="bars"></div>
+  <div class="legend">
+    <span><i class="dot" style="background:#8b98a5"></i>trivial · 本地小模型 (免费)</span>
+    <span><i class="dot" style="background:#58a6ff"></i>standard · DeepSeek-V3</span>
+    <span><i class="dot" style="background:#d29922"></i>hard · DeepSeek-R1</span>
+  </div>
+  <div class="legend" id="tierCounts"></div>
+</div>
+
+<div class="section">
+  <h2>最近路由决策</h2>
+  <table>
+    <thead><tr>
+      <th>时间</th><th>档位</th><th>模型</th><th>难度分</th><th>评分理由</th>
+      <th>Token 入/出</th><th>成本</th><th>耗时</th><th>状态</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt$ = v => '$' + v.toFixed(4);
+const fmtT = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : n;
+
+async function refresh() {
+  try {
+    const d = await (await fetch('/v1/stats')).json();
+    $('n').textContent = d.n;
+    $('cost').textContent = fmt$(d.cost);
+    $('savedH').textContent = fmt$(d.saved_vs_hard);
+    $('savedS').textContent = fmt$(d.saved_vs_standard);
+    $('tokens').textContent = fmtT(d.pt) + ' / ' + fmtT(d.ct);
+
+    const t = d.tiers || {}, total = (t.trivial||0)+(t.standard||0)+(t.hard||0) || 1;
+    $('bars').innerHTML = ['trivial','standard','hard'].map(k =>
+      `<div class="bar bar-${k}" style="width:${((t[k]||0)/total*100).toFixed(1)}%"></div>`).join('');
+    $('tierCounts').textContent =
+      `trivial ${t.trivial||0} 次 · standard ${t.standard||0} 次 · hard ${t.hard||0} 次`;
+
+    $('rows').innerHTML = (d.recent||[]).map(r => {
+      const dt = new Date(r.ts*1000).toLocaleTimeString('zh-CN', {hour12:false});
+      const cls = r.status === 'error' ? 'error' : r.tier;
+      return `<tr>
+        <td>${dt}</td>
+        <td><span class="tag tag-${cls}">${r.tier}</span></td>
+        <td>${r.model}</td>
+        <td>${r.score}</td>
+        <td class="reasons" title="${r.reasons||''}">${r.reasons||''}</td>
+        <td>${fmtT(r.prompt_tokens)} / ${fmtT(r.completion_tokens)}</td>
+        <td>${fmt$(r.cost_usd)}</td>
+        <td>${r.latency_ms}ms</td>
+        <td>${r.status}${r.error ? ': '+r.error : ''}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="9" style="color:#8b98a5">暂无请求，发起一次调用后这里会显示路由决策</td></tr>';
+  } catch (e) { console.error(e); }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
