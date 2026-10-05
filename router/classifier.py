@@ -106,6 +106,20 @@ def _all_text(messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+
+def estimate_tokens(text: str) -> int:
+    """CJK 感知的 token 估算: 中日韩字符 ≈ 1 token/字, 其他 ≈ 1 token/4 字符.
+
+    纯按 4 字符/token 会把中文输入低估 3-4 倍,
+    直接影响 long_context 检测与上下文窗口硬过滤的准确性.
+    """
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    return max(1, cjk + other // 4)
+
+
 def classify(payload: dict) -> Features:
     """对一次 OpenAI 格式 chat/completions 请求打分.
 
@@ -241,7 +255,7 @@ def detect_task_profile(payload: dict) -> dict:
     if WRITING_RE.search(full):
         tags.add("writing")
 
-    est_tokens = max(1, len(full) // 4)
+    est_tokens = estimate_tokens(full)
     if est_tokens > 16000:
         tags.add("long_context")
 

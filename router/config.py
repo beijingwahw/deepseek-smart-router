@@ -1,4 +1,4 @@
-"""配置加载: YAML + 默认值 (v2 多供应商模型池)."""
+"""配置加载: YAML + 默认值 (多供应商模型池 + 全部子系统开关)."""
 
 from __future__ import annotations
 

@@ -13,7 +13,9 @@ Harness 接入: 把 base_url 指向 http://localhost:8355/v1 即可.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -70,22 +72,45 @@ CASCADE = cfg.get("cascade", {})
 MOA = cfg.get("moa", {})
 _config_mtime: float | None = None
 
-app = FastAPI(title="DeepSeek Smart Router", version="3.0.0")
+
+@asynccontextmanager
+async def lifespan(_app):
+    yield
+    # 关闭时统一释放资源
+    stats.close()
+    learner.close()
+    if cache:
+        cache.close()
+    if memory:
+        memory.close()
+    if router._client is not None:
+        await router._client.aclose()
 
 
-def _reload_if_changed() -> None:
-    """配置文件变更时热重载: 模型池/阈值/预算/缓存/级联立即生效, 学习成果保留."""
+app = FastAPI(title="DeepSeek Smart Router", version="3.0.0",
+              lifespan=lifespan)
+
+
+def _reload_if_changed(force: bool = False,
+                       path: str | None = None) -> bool:
+    """配置文件变更时热重载: 模型池/阈值/预算/缓存/级联立即生效, 学习成果保留.
+
+    force=True 时跳过 mtime 比较直接重载 (Admin API 用).
+    返回是否发生了重载.
+    """
     global cfg, router, cache, memory, TH, ALIASES, BUDGET, CASCADE, MOA
     global _config_mtime
-    if not CONFIG_PATH or not Path(CONFIG_PATH).exists():
-        return
-    mtime = os.path.getmtime(CONFIG_PATH)
-    if _config_mtime is None:
-        _config_mtime = mtime
-        return
-    if mtime <= _config_mtime:
-        return
-    cfg = load_config(CONFIG_PATH)
+    path = path or CONFIG_PATH
+    if not path or not Path(path).exists():
+        return False
+    mtime = os.path.getmtime(path)
+    if not force:
+        if _config_mtime is None:
+            _config_mtime = mtime
+            return False
+        if mtime <= _config_mtime:
+            return False
+    cfg = load_config(path)
     disabled = router.disabled  # 保留运行时禁用状态
     memory = memory if memory is not None else _build_memory(cfg)
     router = SmartRouter(cfg, learner=learner, memory=memory)
@@ -99,6 +124,7 @@ def _reload_if_changed() -> None:
     CASCADE = cfg.get("cascade", {})
     MOA = cfg.get("moa", {})
     _config_mtime = mtime
+    return True
 
 
 @app.middleware("http")
@@ -110,8 +136,9 @@ async def hot_reload_middleware(request: Request, call_next):
 # ---------------- 内部 ----------------
 
 def _estimate_tokens(payload: dict) -> int:
-    total = sum(len(str(m.get("content", ""))) for m in payload.get("messages", []))
-    return max(1, total // 4)
+    from .classifier import estimate_tokens
+    total = "".join(str(m.get("content", "")) for m in payload.get("messages", []))
+    return estimate_tokens(total)
 
 
 def _ref_price(tier: str) -> dict:
@@ -235,8 +262,162 @@ class _CacheResult:
         self.fell_back_from = None
 
 
+def _router_headers(result, score: int, request_id: int | None = None,
+                    extra: dict | None = None) -> dict:
+    h = {"X-Router-Tier": result.tier, "X-Router-Model": result.model,
+         "X-Router-Score": str(score)}
+    if request_id:
+        h["X-Router-Request-Id"] = str(request_id)
+    return {**h, **(extra or {})}
+
+
+def _handle_cache_hit(payload, task, tier, query, f, reasons):
+    """语义缓存命中则返回响应, 否则 None."""
+    if not _cacheable(payload, task):
+        return None
+    cached = cache.lookup(query, tier)
+    if cached is None:
+        return None
+    result = _CacheResult(cached.get("model", "unknown"))
+    request_id = _record(result, f.score, reasons + "; 语义缓存命中",
+                         cached.get("usage", {}) or {}, "cache_hit",
+                         query=query)
+    cached["router"] = {**cached.get("router", {}),
+                        "request_id": request_id, "tier": "cache",
+                        "score": f.score}
+    return JSONResponse(content=cached,
+                        headers={"X-Router-Tier": "cache",
+                                 "X-Router-Cache": "hit",
+                                 "X-Router-Request-Id": str(request_id)})
+
+
+async def _handle_stream(chain, payload, task, query, f, reasons):
+    """流式路径: 直接走候选链 (级联与缓存只服务非流式)."""
+    try:
+        result, stream, usage_holder = await router.chat_stream(
+            chain, payload, task)
+    except UpstreamError as e:
+        return JSONResponse(status_code=502,
+                            content={"error": {"message": str(e)}})
+
+    async def gen():
+        async for chunk in stream:
+            yield chunk
+        if not usage_holder:
+            usage_holder["prompt_tokens"] = _estimate_tokens(payload)
+            usage_holder["completion_tokens"] = 0
+        _record(result, f.score, reasons, usage_holder, result.status,
+                query=query)
+        _mem_record(query, result.model_name, 0.75)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=_router_headers(result, f.score))
+
+
+async def _handle_moa(tier, pinned, chain, payload, task, query, f, reasons):
+    """MoA 竞技场: 开赛则返回冠军响应, 否则 None."""
+    if not (MOA.get("enabled") and not pinned
+            and tier in MOA.get("tiers", ["hard"]) and len(chain) >= 2):
+        return None
+    try:
+        outcome = await run_moa(router, chain, payload, task,
+                                fanout=MOA.get("fanout", 3))
+    except RuntimeError as e:
+        return JSONResponse(status_code=502,
+                            content={"error": {"message": str(e)}})
+    winner, request_id = outcome.winner, 0
+    for b in outcome.members:  # 逐参赛者记账 + 竞赛学习
+        if not b["ok"]:
+            continue
+        mcfg = cfg["models"][b["model_name"]]
+        member = SimpleNamespace(
+            model_name=b["model_name"], model=b["model"],
+            provider=mcfg["provider"], tier=mcfg.get("tier", tier),
+            latency_ms=b["latency_ms"])
+        res_usage = b["usage"] or {}
+        if not res_usage.get("prompt_tokens"):
+            res_usage["prompt_tokens"] = _estimate_tokens(payload)
+            res_usage["completion_tokens"] = 0
+        rid = _record(member, f.score,
+                      reasons + ("; MoA 冠军" if b["winner"] else "; MoA 参赛"),
+                      res_usage,
+                      "moa_winner" if b["winner"] else "moa_member",
+                      query=query)
+        if b["winner"]:
+            request_id = rid
+        reward = 0.9 if b["winner"] else 0.3
+        learner.record(b["model_name"], task.get("tags") or [], reward)
+        _mem_record(query, b["model_name"], reward)
+    body = dict(winner.response or {})
+    body["router"] = {
+        "request_id": request_id, "tier": winner.tier,
+        "model_name": winner.model_name, "model": winner.model,
+        "provider": winner.provider, "score": f.score,
+        "reasons": f.reasons, "status": "moa_winner",
+        "moa": {"fanout": len(outcome.members),
+                "winner_judge_score": outcome.winner_judge_score,
+                "degraded": outcome.degraded, "members": outcome.members},
+    }
+    if _cacheable(payload, task):
+        cache.store(query, tier, body, winner.model)
+    return JSONResponse(content=body,
+                        headers=_router_headers(winner, f.score, request_id,
+                                                {"X-Router-MoA": "winner"}))
+
+
+async def _try_cascade(tier, pinned, payload, task, query, f, reasons):
+    """级联: 一次通过返回响应; 升级返回 (None, cascade_info); 未启用 (None, None)."""
+    if not (CASCADE.get("enabled") and not pinned
+            and cascade_start_tier(tier) is not None):
+        return None, None
+    start_tier = cascade_start_tier(tier)
+    start_chain = router.candidate_chain(start_tier, None, task, query)
+    if not start_chain:
+        return None, None
+    try:
+        first = await router.chat(start_chain, payload, task)
+    except UpstreamError:
+        return None, None  # 便宜档全挂: 落到原计划链
+    jscore, jreasons = judge_response(first.response, task)
+    usage1 = first.usage or {}
+    if not usage1.get("prompt_tokens"):
+        usage1["prompt_tokens"] = _estimate_tokens(payload)
+        usage1["completion_tokens"] = 0
+    if should_escalate(jscore, CASCADE.get("judge_threshold", 0.55)):
+        # 不合格: 差评反哺 + 升级到原计划链
+        learner.record(first.model_name, task.get("tags") or [], 0.2)
+        _mem_record(query, first.model_name, 0.2)
+        _record(first, f.score,
+                reasons + f"; 级联升级(评审{jscore}: "
+                f"{'/'.join(jreasons) or '质量不足'})",
+                usage1, "cascade_escalated", query=query)
+        return None, {"started_tier": start_tier, "first_model": first.model,
+                      "judge_score": jscore, "escalated": True}
+    # 合格: 好评反哺, 直接交卷 (省下了高档的钱)
+    learner.record(first.model_name, task.get("tags") or [], 0.9)
+    _mem_record(query, first.model_name, 0.9)
+    request_id = _record(first, f.score,
+                         reasons + f"; 级联一次通过(评审{jscore})",
+                         usage1, "cascade_accept", query=query)
+    body = dict(first.response or {})
+    body["router"] = {
+        "request_id": request_id, "tier": first.tier,
+        "model_name": first.model_name, "model": first.model,
+        "provider": first.provider, "score": f.score,
+        "reasons": f.reasons, "status": "cascade_accept",
+        "cascade": {"started_tier": start_tier, "judge_score": jscore,
+                    "escalated": False, "planned_tier": tier},
+    }
+    if _cacheable(payload, task):
+        cache.store(query, tier, body, first.model)
+    return JSONResponse(content=body,
+                        headers=_router_headers(first, f.score, request_id,
+                                                {"X-Router-Cascade": "accept"})), None
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    """编排骨架: 预算 -> 缓存 -> 流式 -> MoA -> 级联 -> 常规候选链."""
     payload = await request.json()
     tier, pinned, f = _plan(payload)
     _, budget_action = apply_budget(tier, stats.daily_spend(), BUDGET)
@@ -249,159 +430,20 @@ async def chat_completions(request: Request):
     query = _cache_query(payload)
     chain = router.candidate_chain(tier, pinned, task, query)
     reasons = "; ".join(f.reasons) or "无显著信号"
-    is_stream = bool(payload.get("stream"))
 
-    # ---- Frontier 第一层: 语义缓存 (仅非流式安全请求) ----
-    if _cacheable(payload, task):
-        cached = cache.lookup(query, tier)
-        if cached is not None:
-            result = _CacheResult(cached.get("model", "unknown"))
-            request_id = _record(result, f.score, reasons + "; 语义缓存命中",
-                                 cached.get("usage", {}) or {}, "cache_hit",
-                                 query=query)
-            cached["router"] = {**cached.get("router", {}),
-                                "request_id": request_id, "tier": "cache",
-                                "score": f.score}
-            return JSONResponse(content=cached,
-                                headers={"X-Router-Tier": "cache",
-                                         "X-Router-Cache": "hit",
-                                         "X-Router-Request-Id": str(request_id)})
-
-    # ---- 流式: 直接走候选链 (级联与缓存只服务非流式) ----
-    if is_stream:
-        try:
-            result, stream, usage_holder = await router.chat_stream(
-                chain, payload, task)
-        except UpstreamError as e:
-            return JSONResponse(status_code=502,
-                                content={"error": {"message": str(e)}})
-
-        async def gen():
-            async for chunk in stream:
-                yield chunk
-            if not usage_holder:
-                usage_holder["prompt_tokens"] = _estimate_tokens(payload)
-                usage_holder["completion_tokens"] = 0
-            _record(result, f.score, reasons, usage_holder, result.status,
-                    query=query)
-            _mem_record(query, result.model_name, 0.75)
-
-        return StreamingResponse(
-            gen(), media_type="text/event-stream",
-            headers={"X-Router-Tier": result.tier,
-                     "X-Router-Model": result.model,
-                     "X-Router-Score": str(f.score)})
-
-    # ---- Omega: MoA 竞技场 (困难任务多模型并行竞赛, 评审选冠军) ----
-    if (MOA.get("enabled") and not pinned
-            and tier in MOA.get("tiers", ["hard"]) and len(chain) >= 2):
-        try:
-            outcome = await run_moa(router, chain, payload, task,
-                                    fanout=MOA.get("fanout", 3))
-        except RuntimeError as e:
-            return JSONResponse(status_code=502,
-                                content={"error": {"message": str(e)}})
-        winner = outcome.winner
-        request_id = 0
-        for b in outcome.members:  # 逐参赛者记账 + 竞赛学习
-            if not b["ok"]:
-                continue
-            res_usage = b["usage"] or {}
-            if not res_usage.get("prompt_tokens"):
-                res_usage["prompt_tokens"] = _estimate_tokens(payload)
-                res_usage["completion_tokens"] = 0
-            class _Member:
-                model_name = b["model_name"]
-                model = b["model"]; provider = cfg["models"][b["model_name"]]["provider"]
-                tier = cfg["models"][b["model_name"]].get("tier", tier)
-                latency_ms = b["latency_ms"]; fell_back_from = None
-            rid = _record(_Member(), f.score,
-                          reasons + ("; MoA 冠军" if b["winner"] else "; MoA 参赛"),
-                          res_usage,
-                          "moa_winner" if b["winner"] else "moa_member",
-                          query=query)
-            if b["winner"]:
-                request_id = rid
-            reward = 0.9 if b["winner"] else 0.3
-            learner.record(b["model_name"], task.get("tags") or [], reward)
-            _mem_record(query, b["model_name"], reward)
-        body = dict(winner.response or {})
-        body["router"] = {
-            "request_id": request_id, "tier": winner.tier,
-            "model_name": winner.model_name, "model": winner.model,
-            "provider": winner.provider, "score": f.score,
-            "reasons": f.reasons, "status": "moa_winner",
-            "moa": {"fanout": len(outcome.members),
-                    "winner_judge_score": outcome.winner_judge_score,
-                    "degraded": outcome.degraded,
-                    "members": outcome.members},
-        }
-        if _cacheable(payload, task):
-            cache.store(query, tier, body, winner.model)
-        return JSONResponse(
-            content=body,
-            headers={"X-Router-Tier": winner.tier,
-                     "X-Router-Model": winner.model,
-                     "X-Router-Score": str(f.score),
-                     "X-Router-MoA": "winner",
-                     "X-Router-Request-Id": str(request_id)})
-
-    # ---- Frontier 第二层: 级联升级 (便宜档先答, 评审不合格再升级) ----
-    cascade_info = None
-    if (CASCADE.get("enabled") and not pinned
-            and cascade_start_tier(tier) is not None):
-        start_tier = cascade_start_tier(tier)
-        start_chain = router.candidate_chain(start_tier, None, task, query)
-        if start_chain:
-            try:
-                first = await router.chat(start_chain, payload, task)
-                jscore, jreasons = judge_response(first.response, task)
-                usage1 = first.usage or {}
-                if not usage1.get("prompt_tokens"):
-                    usage1["prompt_tokens"] = _estimate_tokens(payload)
-                    usage1["completion_tokens"] = 0
-                if should_escalate(jscore,
-                                   CASCADE.get("judge_threshold", 0.55)):
-                    # 不合格: 差评反哺 + 升级到原计划链
-                    learner.record(first.model_name, task.get("tags") or [], 0.2)
-                    _mem_record(query, first.model_name, 0.2)
-                    _record(first, f.score,
-                            reasons + f"; 级联升级(评审{jscore}: "
-                            f"{'/'.join(jreasons) or '质量不足'})",
-                            usage1, "cascade_escalated", query=query)
-                    cascade_info = {"started_tier": start_tier,
-                                    "first_model": first.model,
-                                    "judge_score": jscore,
-                                    "escalated": True}
-                else:
-                    # 合格: 好评反哺, 直接交卷 (省下了高档的钱)
-                    learner.record(first.model_name, task.get("tags") or [], 0.9)
-                    _mem_record(query, first.model_name, 0.9)
-                    request_id = _record(first, f.score,
-                                         reasons + f"; 级联一次通过(评审{jscore})",
-                                         usage1, "cascade_accept", query=query)
-                    body = dict(first.response or {})
-                    body["router"] = {
-                        "request_id": request_id, "tier": first.tier,
-                        "model_name": first.model_name, "model": first.model,
-                        "provider": first.provider, "score": f.score,
-                        "reasons": f.reasons, "status": "cascade_accept",
-                        "cascade": {"started_tier": start_tier,
-                                    "judge_score": jscore,
-                                    "escalated": False,
-                                    "planned_tier": tier},
-                    }
-                    if _cacheable(payload, task):
-                        cache.store(query, tier, body, first.model)
-                    return JSONResponse(
-                        content=body,
-                        headers={"X-Router-Tier": first.tier,
-                                 "X-Router-Model": first.model,
-                                 "X-Router-Score": str(f.score),
-                                 "X-Router-Cascade": "accept",
-                                 "X-Router-Request-Id": str(request_id)})
-            except UpstreamError:
-                pass  # 便宜档全挂: 落到原计划链
+    resp = _handle_cache_hit(payload, task, tier, query, f, reasons)
+    if resp is not None:
+        return resp
+    if payload.get("stream"):
+        return await _handle_stream(chain, payload, task, query, f, reasons)
+    resp = await _handle_moa(tier, pinned, chain, payload, task, query, f,
+                             reasons)
+    if resp is not None:
+        return resp
+    resp, cascade_info = await _try_cascade(tier, pinned, payload, task,
+                                            query, f, reasons)
+    if resp is not None:
+        return resp
 
     # ---- 常规路径: 计划候选链 ----
     try:
@@ -432,12 +474,8 @@ async def chat_completions(request: Request):
         jscore, _ = judge_response(body, task)
         if jscore >= CASCADE.get("judge_threshold", 0.55):
             cache.store(query, tier, body, result.model)
-    return JSONResponse(
-        content=body,
-        headers={"X-Router-Tier": result.tier,
-                 "X-Router-Model": result.model,
-                 "X-Router-Score": str(f.score),
-                 "X-Router-Request-Id": str(request_id)})
+    return JSONResponse(content=body,
+                        headers=_router_headers(result, f.score, request_id))
 
 
 @app.post("/v1/feedback")
@@ -450,9 +488,13 @@ async def feedback(request: Request):
     """
     body = await request.json()
     score = body.get("score")
-    if score is None or not (0 <= float(score) <= 1):
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        score = -1.0
+    if not (0 <= score <= 1):
         return JSONResponse(status_code=422,
-                            content={"error": {"message": "score 必须是 0-1"}})
+                            content={"error": {"message": "score 必须是 0-1 的数字"}})
     model_name = body.get("model")
     rec = None
     if body.get("request_id") is not None:
@@ -520,22 +562,11 @@ async def admin_enable(name: str):
 
 @app.post("/v1/admin/reload")
 async def admin_reload():
-    global _config_mtime
-    _config_mtime = None  # 强制下一次检查触发重载
-    _reload_if_changed()
-    return {"ok": True, "models": list(cfg["models"].keys())}
+    reloaded = _reload_if_changed(force=True)
+    return {"ok": True, "reloaded": reloaded,
+            "models": list(cfg["models"].keys())}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    stats.close()
-    learner.close()
-    if cache:
-        cache.close()
-    if memory:
-        memory.close()

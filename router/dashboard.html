@@ -90,6 +90,9 @@
 const $ = id => document.getElementById(id);
 const fmt$ = v => '$' + v.toFixed(4);
 const fmtT = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : n;
+// XSS 防护: 所有进入 innerHTML 的动态字符串统一转义
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 async function refresh() {
   try {
@@ -128,24 +131,24 @@ async function refresh() {
       const l = learner[m] || {}, lat = latency[m] || {};
       const wr = l.win_rate !== undefined ? (l.win_rate*100).toFixed(0)+'%' : '-';
       const color = l.win_rate >= 0.7 ? '#3fb950' : l.win_rate >= 0.4 ? '#d29922' : '#f85149';
-      return `<tr><td>${m}</td>
+      return `<tr><td>${esc(m)}</td>
         <td style="color:${color};font-weight:600">${wr}</td>
         <td>${l.trials||0}</td><td>${lat.avg_latency_ms||0}ms</td><td>${lat.calls||0}</td></tr>`;
     }).join('') || '<tr><td colspan="5" style="color:#8b98a5">暂无学习数据 —— 调用几次或 POST /v1/feedback 后, 这里会显示每个模型的学习胜率</td></tr>';
 
     $('rows').innerHTML = (d.recent||[]).map(r => {
       const dt = new Date(r.ts*1000).toLocaleTimeString('zh-CN', {hour12:false});
-      const cls = r.status === 'error' ? 'error' : r.tier;
+      const cls = r.status === 'error' ? 'error' : esc(r.tier);
       return `<tr>
         <td>${dt}</td>
-        <td><span class="tag tag-${cls}">${r.tier}</span></td>
-        <td>${r.model}</td>
+        <td><span class="tag tag-${cls}">${esc(r.tier)}</span></td>
+        <td>${esc(r.model)}</td>
         <td>${r.score}</td>
-        <td class="reasons" title="${r.reasons||''}">${r.reasons||''}</td>
+        <td class="reasons" title="${esc(r.reasons)}">${esc(r.reasons)}</td>
         <td>${fmtT(r.prompt_tokens)} / ${fmtT(r.completion_tokens)}</td>
         <td>${fmt$(r.cost_usd)}</td>
         <td>${r.latency_ms}ms</td>
-        <td>${r.status}${r.error ? ': '+r.error : ''}</td>
+        <td>${esc(r.status)}${r.error ? ': '+esc(r.error) : ''}</td>
       </tr>`;
     }).join('') || '<tr><td colspan="9" style="color:#8b98a5">暂无请求，发起一次调用后这里会显示路由决策</td></tr>';
   } catch (e) { console.error(e); }

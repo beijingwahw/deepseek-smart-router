@@ -47,6 +47,8 @@ class Stats:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")  # 多组件共享库防锁
         with self._lock:
             self._conn.executescript(SCHEMA)
             # 老库迁移: v3 新增 query 列
