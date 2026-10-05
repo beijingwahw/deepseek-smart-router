@@ -18,6 +18,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strategy": "best_fit",
         # λ 质量-成本拨盘: 0=极限省钱, 1=极限质量, 0.55 为平衡默认
         "quality_lambda": 0.55,
+        # 延迟感知权重: 实测平均延迟对适配度的影响 (0 关闭)
+        "latency_weight": 0.05,
         "fallback_enabled": True,
         # 某档全部不可用时的跨档降级顺序
         "cross_tier_fallback": {
@@ -92,6 +94,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "tiers": ["hard"],   # 只对困难档开赛
         "fanout": 3,
+        "mode": "select",    # select(选冠军) | aggregate(聚合全部提案)
+    },
+    # Apex: LLM-as-Judge (用小模型替代启发式评审)
+    "judge": {
+        "mode": "heuristic",  # heuristic(零成本) | model(池内模型打分)
+        # "model": "ds-v3",   # mode=model 时指定评审模型
+    },
+    # Apex: 影子灰度 (新模型后台平行评估, 零风险上线)
+    "shadow": {
+        "enabled": False,
+        "sample_rate": 0.2,   # 对 20% 真实流量发起影子调用
+        "models": [],         # 影子模型 (池内名称)
     },
     "stats": {"db_path": "router_stats.db"},
 }

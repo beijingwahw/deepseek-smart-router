@@ -14,6 +14,7 @@ thresholds:
 routing:
   strategy: best_fit            # best_fit(任务类型x能力画像, 推荐) | priority | cheapest | round_robin
   quality_lambda: 0.55          # λ 质量-成本拨盘: 0=极限省钱, 1=极限质量
+  latency_weight: 0.05          # 延迟感知权重: 实测延迟对适配度的影响 (0 关闭)
   fallback_enabled: true        # 失败时沿候选链降级
   cross_tier_fallback:          # 某档全挂时的跨档降级顺序
     hard: [standard]
@@ -190,6 +191,21 @@ aliases:
 #   enabled: true
 #   tiers: [hard]          # 只对困难档开赛 (成本考虑)
 #   fanout: 3              # 参赛模型数
+#   mode: select           # select(选冠军) | aggregate(聚合全部提案为最终答案)
+
+# ---------------- LLM-as-Judge (Apex) ----------------
+# 用小模型替代启发式给级联/影子答案打分, 失败自动回退启发式
+# judge:
+#   mode: model
+#   model: ds-v3           # 池内评审模型 (建议用便宜快的)
+
+# ---------------- 影子灰度 (Apex) ----------------
+# 新模型标记 shadow: true 后不服务用户, 后台平行评估;
+# 数据攒够后 POST /v1/admin/models/{name}/promote 一键转正
+# shadow:
+#   enabled: true
+#   sample_rate: 0.2       # 对 20% 真实流量发起影子调用
+#   models: [new-llm]
 
 stats:
   db_path: router_stats.db   # 请求统计与学习数据共用此库

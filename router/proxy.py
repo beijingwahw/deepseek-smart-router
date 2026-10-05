@@ -78,7 +78,9 @@ class SmartRouter:
         self.routing = cfg["routing"]
         self.learner = learner          # Genesis: 自适应学习引擎 (可选)
         self.memory = memory            # Omega: kNN 经验回忆 (可选)
+        self.latency_stats = None       # Apex: 延迟统计提供者 (可选 callable)
         self.disabled: set[str] = set()  # 运行时禁用 (Admin API)
+        self.promoted: set[str] = set()  # 影子模型转正 (Admin API)
         cb_cfg = self.routing.get("circuit_breaker", {})
         self.breakers = {
             name: CircuitBreaker(cb_cfg.get("failure_threshold", 3),
@@ -135,13 +137,25 @@ class SmartRouter:
             detail["recall_bonus"] = bonus
             if bonus != 0.0:
                 score = max(0.0, min(100.0, score + 15.0 * bonus))
+        # 延迟感知: 实测平均延迟进入适配度 (默认权重 5%)
+        lw = float(self.routing.get("latency_weight", 0.05))
+        if self.latency_stats is not None and lw > 0:
+            key = f"{m['provider']}/{m['model']}"
+            avg = (self.latency_stats().get(key, {}) or {}).get(
+                "avg_latency_ms")
+            if avg:
+                fit = 1.0 / (1.0 + avg / 5000.0)  # 0ms→1.0, 5s→0.5, 20s→0.2
+                detail["latency_fit"] = round(fit, 2)
+                score = score * (1 - lw) + 100 * fit * lw
         return round(score, 1), detail
 
     def candidates(self, tier: str, task: dict | None = None,
                    query: str = "") -> list[str]:
         """某难度档的启用模型, 按策略排序 (best_fit 时按任务适配度+回忆)."""
         names = [n for n, m in enabled_models(self.cfg).items()
-                 if m.get("tier") == tier and n not in self.disabled]
+                 if m.get("tier") == tier and n not in self.disabled
+                 # 影子模型不进正常候选链 (promote 后解除)
+                 and (not m.get("shadow") or n in self.promoted)]
         strategy = self.routing.get("strategy", "best_fit")
         if strategy == "best_fit" and task is not None:
             max_price = self._max_price()

@@ -83,3 +83,44 @@ def cascade_start_tier(tier: str) -> str | None:
 
 def should_escalate(score: float, threshold: float) -> bool:
     return score < threshold
+
+
+# ---------------- LLM-as-Judge (可选评审器) ----------------
+
+_JUDGE_PROMPT = (
+    "你是严格的答案质量评审。请给以下回答打 0-1 分 (1=完美, 0=完全不可用)。\n"
+    "评审维度: 是否真正回答了问题、事实正确性、完整性、有无拒答或敷衍。\n"
+    "只输出一个 0 到 1 之间的小数, 不要输出任何其他内容。\n\n"
+    "【用户问题】\n{question}\n\n【待评审回答】\n{answer}")
+
+
+async def ajudge_response(router, body: dict, task: dict,
+                          judge_cfg: dict, question: str = ""
+                          ) -> tuple[float, list[str]]:
+    """异步评审: judge.mode == "model" 时用池内小模型打分, 失败回退启发式."""
+    if judge_cfg.get("mode") != "model":
+        return judge_response(body, task)
+    judge_model = judge_cfg.get("model")
+    if not judge_model or judge_model not in router.models:
+        return judge_response(body, task)
+    try:
+        answer = (body["choices"][0]["message"].get("content") or "")[:4000]
+    except (KeyError, IndexError, TypeError):
+        return judge_response(body, task)
+    prompt = _JUDGE_PROMPT.format(question=question[:2000], answer=answer)
+    try:
+        res = await router.chat(
+            [judge_model],
+            {"messages": [{"role": "user", "content": prompt}],
+             "max_tokens": 16, "temperature": 0},
+            task)
+        text = (res.response["choices"][0]["message"].get("content") or "")
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not match:
+            raise ValueError("评审模型未输出分数")
+        score = max(0.0, min(1.0, float(match.group(1))))
+        if score > 1:  # 容忍输出 0-10 或百分制
+            score = score / 10 if score <= 10 else score / 100
+        return round(score, 2), [f"LLM评审({judge_model}): {score}"]
+    except Exception:
+        return judge_response(body, task)  # 任何异常回退启发式

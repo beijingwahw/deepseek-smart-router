@@ -23,8 +23,43 @@ from .proxy import RouteResult
 class MoaOutcome:
     winner: RouteResult
     winner_judge_score: float
-    members: list[dict] = field(default_factory=list)  # 全部参赛者成绩
+    members: list[dict] = field(default_factory=list)   # 全部参赛者成绩
+    responses: dict = field(default_factory=dict)        # 提案原文 (聚合用)
     degraded: bool = False  # 只有 <=1 个有效响应时退化为普通路由
+
+
+_AGGREGATE_PROMPT = (
+    "你是答案聚合器。下面是多个模型对同一问题的回答提案。\n"
+    "请综合各提案的优点、纠正其中的错误, 输出一个最终的、最优的回答。\n"
+    "直接给出最终答案, 不要点评提案, 不要提及「提案」二字。\n\n"
+    "【原始问题】\n{question}\n\n{proposals}")
+
+
+async def aggregate_proposals(router, aggregator: str, question: str,
+                              members: list[dict], proposals: dict,
+                              task: dict) -> RouteResult:
+    """MoA 聚合模式: 冠军模型作为聚合器, 把所有提案合成最终答案.
+
+    members: run_moa 的参赛榜单; proposals: {model_name: response_body}
+    """
+    blocks = []
+    for b in members:
+        if not b["ok"]:
+            continue
+        body = proposals.get(b["model_name"]) or {}
+        try:
+            text = body["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            text = ""
+        if text.strip():
+            blocks.append(f"【提案 {len(blocks)+1}】\n{text[:3000]}")
+    if len(blocks) < 2:
+        raise ValueError("有效提案不足, 无法聚合")
+    prompt = _AGGREGATE_PROMPT.format(question=question[:2000],
+                                      proposals="\n\n".join(blocks))
+    return await router.chat(
+        [aggregator],
+        {"messages": [{"role": "user", "content": prompt}]}, task)
 
 
 async def run_moa(router, chain: list[str], payload: dict, task: dict,
@@ -37,6 +72,7 @@ async def run_moa(router, chain: list[str], payload: dict, task: dict,
 
     valid: list[tuple[RouteResult, float, list[str]]] = []
     board: list[dict] = []
+    responses: dict = {}
     for name, res in zip(members, results):
         if isinstance(res, Exception):
             board.append({"model_name": name, "ok": False,
@@ -44,6 +80,7 @@ async def run_moa(router, chain: list[str], payload: dict, task: dict,
             continue
         score, reasons = judge_response(res.response, task)
         valid.append((res, score, reasons))
+        responses[name] = res.response
         board.append({"model_name": name, "model": res.model, "ok": True,
                       "judge_score": score, "judge_reasons": reasons,
                       "latency_ms": res.latency_ms, "usage": res.usage})
@@ -56,4 +93,5 @@ async def run_moa(router, chain: list[str], payload: dict, task: dict,
     for b in board:
         b["winner"] = b.get("model_name") == winner.model_name
     return MoaOutcome(winner=winner, winner_judge_score=wscore,
-                      members=board, degraded=len(valid) == 1)
+                      members=board, responses=responses,
+                      degraded=len(valid) == 1)

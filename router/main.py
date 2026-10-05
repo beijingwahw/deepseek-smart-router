@@ -25,11 +25,13 @@ from .cache import SemanticCache
 from .classifier import classify, detect_task_profile, route
 from .config import enabled_models, load_config
 from .embedder import build_embedder
-from .judge import cascade_start_tier, judge_response, should_escalate
+from .judge import (ajudge_response, cascade_start_tier, judge_response,
+                    should_escalate)
 from .learner import Learner
 from .memory import ExperienceMemory
-from .moa import run_moa
+from .moa import aggregate_proposals, run_moa
 from .proxy import SmartRouter, UpstreamError
+from .shadow import ShadowRunner
 from .stats import Stats, calc_cost
 
 CONFIG_PATH = os.environ.get("ROUTER_CONFIG")
@@ -39,6 +41,7 @@ CONFIG_PATH = os.environ.get("ROUTER_CONFIG")
 cfg = load_config()
 stats = Stats(cfg["stats"]["db_path"])
 learner = Learner(cfg["stats"]["db_path"])
+shadow_runner = ShadowRunner(cfg.get("shadow", {}))
 
 
 def _build_memory(cfg):
@@ -52,6 +55,7 @@ def _build_memory(cfg):
 
 memory = _build_memory(cfg)
 router = SmartRouter(cfg, learner=learner, memory=memory)
+router.latency_stats = stats.latency_by_model  # 延迟感知接线
 
 
 def _build_cache(cfg):
@@ -70,6 +74,7 @@ ALIASES = cfg.get("aliases", {})
 BUDGET = cfg.get("budget", {})
 CASCADE = cfg.get("cascade", {})
 MOA = cfg.get("moa", {})
+JUDGE = cfg.get("judge", {})
 _config_mtime: float | None = None
 
 
@@ -87,7 +92,7 @@ async def lifespan(_app):
         await router._client.aclose()
 
 
-app = FastAPI(title="DeepSeek Smart Router", version="3.0.0",
+app = FastAPI(title="DeepSeek Smart Router", version="4.0.0",
               lifespan=lifespan)
 
 
@@ -98,8 +103,8 @@ def _reload_if_changed(force: bool = False,
     force=True 时跳过 mtime 比较直接重载 (Admin API 用).
     返回是否发生了重载.
     """
-    global cfg, router, cache, memory, TH, ALIASES, BUDGET, CASCADE, MOA
-    global _config_mtime
+    global cfg, router, cache, memory, shadow_runner
+    global TH, ALIASES, BUDGET, CASCADE, MOA, JUDGE, _config_mtime
     path = path or CONFIG_PATH
     if not path or not Path(path).exists():
         return False
@@ -111,10 +116,12 @@ def _reload_if_changed(force: bool = False,
         if mtime <= _config_mtime:
             return False
     cfg = load_config(path)
-    disabled = router.disabled  # 保留运行时禁用状态
+    disabled, promoted = router.disabled, router.promoted  # 保留运行时状态
     memory = memory if memory is not None else _build_memory(cfg)
     router = SmartRouter(cfg, learner=learner, memory=memory)
-    router.disabled = disabled
+    router.latency_stats = stats.latency_by_model
+    router.disabled, router.promoted = disabled, promoted
+    shadow_runner = ShadowRunner(cfg.get("shadow", {}))
     new_cache = _build_cache(cfg)
     if new_cache is not None or cache is None:
         cache = new_cache or cache  # 缓存对象复用, 保住命中率
@@ -123,6 +130,7 @@ def _reload_if_changed(force: bool = False,
     BUDGET = cfg.get("budget", {})
     CASCADE = cfg.get("cascade", {})
     MOA = cfg.get("moa", {})
+    JUDGE = cfg.get("judge", {})
     _config_mtime = mtime
     return True
 
@@ -172,6 +180,27 @@ def _mem_record(query: str, model_name: str, reward: float) -> None:
         memory.record(query, model_name, reward)
 
 
+async def _judge(body: dict, task: dict, question: str = ""):
+    """统一评审入口: 按配置走启发式或 LLM-as-Judge."""
+    return await ajudge_response(router, body, task, JUDGE, question)
+
+
+def _shadow_learn(name: str, task: dict, reward: float, query: str) -> None:
+    learner.record(name, task.get("tags") or [], reward)
+    _mem_record(query, name, reward)
+
+
+def _shadow_record(name: str, result, jscore: float, query: str) -> None:
+    usage = result.usage or {"prompt_tokens": 0, "completion_tokens": 0}
+    _record(result, 0, f"影子评估(评审{jscore})", usage, "shadow", query=query)
+
+
+def _launch_shadow(payload: dict, task: dict, query: str) -> None:
+    """非流式响应完成后, 后台发起影子灰度评估."""
+    shadow_runner.maybe_launch(router, payload, task, query,
+                               _judge, _shadow_learn, _shadow_record)
+
+
 def _plan(payload: dict) -> tuple[str, str | None, object]:
     """路由计划: (tier, pinned_model, features). 含预算守卫."""
     f = classify(payload)
@@ -195,7 +224,7 @@ def _plan(payload: dict) -> tuple[str, str | None, object]:
 @app.get("/health")
 async def health():
     return {
-        "status": "ok", "version": "3.0.0-omega",
+        "status": "ok", "version": "4.0.0-apex",
         "models": {n: {"provider": m["provider"], "model": m["model"],
                        "tier": m.get("tier"), "enabled": m.get("enabled", True),
                        "disabled_at_runtime": n in router.disabled}
@@ -208,8 +237,15 @@ async def health():
         "memory": {"enabled": memory is not None,
                    "entries": memory.size() if memory else 0},
         "moa": {"enabled": MOA.get("enabled", False),
-                "tiers": MOA.get("tiers", [])},
+                "tiers": MOA.get("tiers", []),
+                "mode": MOA.get("mode", "select")},
+        "judge": {"mode": JUDGE.get("mode", "heuristic")},
+        "shadow": {"enabled": shadow_runner.enabled,
+                   "sample_rate": shadow_runner.sample_rate,
+                   "models": shadow_runner.models,
+                   "launched": shadow_runner.launched},
         "quality_lambda": cfg["routing"].get("quality_lambda", 0.55),
+        "latency_weight": cfg["routing"].get("latency_weight", 0.05),
     }
 
 
@@ -348,19 +384,36 @@ async def _handle_moa(tier, pinned, chain, payload, task, query, f, reasons):
         reward = 0.9 if b["winner"] else 0.3
         learner.record(b["model_name"], task.get("tags") or [], reward)
         _mem_record(query, b["model_name"], reward)
-    body = dict(winner.response or {})
-    body["router"] = {
+    # 聚合模式: 冠军作为聚合器, 把全部提案合成最终答案
+    aggregated = False
+    if MOA.get("mode") == "aggregate" and not outcome.degraded:
+        try:
+            agg = await aggregate_proposals(
+                router, winner.model_name, query, outcome.members,
+                outcome.responses, task)
+            agg_usage = agg.usage or {}
+            _record(agg, f.score, reasons + "; MoA 聚合调用",
+                    agg_usage, "moa_aggregate", query=query)
+            final_body = dict(agg.response or {})
+            aggregated = True
+        except Exception:
+            final_body = dict(winner.response or {})  # 聚合失败回退冠军答案
+    else:
+        final_body = dict(winner.response or {})
+    final_body["router"] = {
         "request_id": request_id, "tier": winner.tier,
         "model_name": winner.model_name, "model": winner.model,
         "provider": winner.provider, "score": f.score,
-        "reasons": f.reasons, "status": "moa_winner",
-        "moa": {"fanout": len(outcome.members),
+        "reasons": f.reasons,
+        "status": "moa_aggregate" if aggregated else "moa_winner",
+        "moa": {"fanout": len(outcome.members), "mode": MOA.get("mode", "select"),
                 "winner_judge_score": outcome.winner_judge_score,
                 "degraded": outcome.degraded, "members": outcome.members},
     }
     if _cacheable(payload, task):
-        cache.store(query, tier, body, winner.model)
-    return JSONResponse(content=body,
+        cache.store(query, tier, final_body, winner.model)
+    _launch_shadow(payload, task, query)
+    return JSONResponse(content=final_body,
                         headers=_router_headers(winner, f.score, request_id,
                                                 {"X-Router-MoA": "winner"}))
 
@@ -378,7 +431,7 @@ async def _try_cascade(tier, pinned, payload, task, query, f, reasons):
         first = await router.chat(start_chain, payload, task)
     except UpstreamError:
         return None, None  # 便宜档全挂: 落到原计划链
-    jscore, jreasons = judge_response(first.response, task)
+    jscore, jreasons = await _judge(first.response, task, query)
     usage1 = first.usage or {}
     if not usage1.get("prompt_tokens"):
         usage1["prompt_tokens"] = _estimate_tokens(payload)
@@ -410,6 +463,7 @@ async def _try_cascade(tier, pinned, payload, task, query, f, reasons):
     }
     if _cacheable(payload, task):
         cache.store(query, tier, body, first.model)
+    _launch_shadow(payload, task, query)
     return JSONResponse(content=body,
                         headers=_router_headers(first, f.score, request_id,
                                                 {"X-Router-Cascade": "accept"})), None
@@ -474,6 +528,7 @@ async def chat_completions(request: Request):
         jscore, _ = judge_response(body, task)
         if jscore >= CASCADE.get("judge_threshold", 0.55):
             cache.store(query, tier, body, result.model)
+    _launch_shadow(payload, task, query)
     return JSONResponse(content=body,
                         headers=_router_headers(result, f.score, request_id))
 
@@ -558,6 +613,17 @@ async def admin_disable(name: str):
 async def admin_enable(name: str):
     router.disabled.discard(name)
     return {"ok": True, "disabled": sorted(router.disabled)}
+
+
+@app.post("/v1/admin/models/{name}/promote")
+async def admin_promote(name: str):
+    """影子模型转正: 数据攒够后一键进入正常候选链."""
+    if name not in cfg["models"]:
+        return JSONResponse(status_code=404,
+                            content={"error": {"message": f"模型不存在: {name}"}})
+    router.promoted.add(name)
+    return {"ok": True, "promoted": sorted(router.promoted),
+            "learner": learner.summary().get(name)}
 
 
 @app.post("/v1/admin/reload")
